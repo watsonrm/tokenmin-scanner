@@ -1,161 +1,217 @@
 # Tokenmin Scanner
 
-**This is the public, Apache-2.0 audit copy of the Tokenmin scanner** — the code
-that walks your local Claude usage, anonymizes it, and decides what (if
-anything) leaves your machine. If you've been invited to the Tokenmin
-friends-and-family preview, this is the code you can read end-to-end *before*
-you trust the bargain.
+**The public, Apache-2.0 audit copy of Tokenmin.** This is the code that decides
+what (if anything) leaves your machine when you run `tokenmin`. About 5 minutes
+of reading, end to end.
 
-> The deal: free in exchange for an anonymized usage snapshot. The scanner
-> code that decides what to send is the code in this repo. Read it, diff it
-> against what your machine is actually running, then make the call.
+The deal: Tokenmin is free during the friends-and-family preview in exchange for
+your anonymized usage data. The scanner that does the anonymization is open
+precisely so the trade is verifiable, not just promised. Read it. Diff it
+against your install. Then decide if you trust the bargain.
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://tokenmin.ai/install.sh | bash
+```
+
+## What you get in the first 60 seconds
+
+```
+~ tokenmin
+  ▶ scanning ~/.claude
+  ✓ found 57 sessions in last 14 days
+  ✓ anonymized
+  ✓ analyzed
+
+  Tokenmin  Claude usage audit
+  ────────────────────────────────────────────────────────────────────────
+  scanned 57 sessions over 14 days
+  est. spend (window): $6,860
+  model mix: Opus 99% · Sonnet 1%
+  ────────────────────────────────────────────────────────────────────────
+
+  Headline  ~$7,151/mo recoverable across 7 fix(es), ~4.8 hrs total
+
+  1. A lot of your spend is on Opus — route by tier
+     $$$$   ▮▮▮▮▮▮▮▮▮▮  $7,055/mo  0.1 hrs · conf 55% · model routing
+     evidence: 100% of $6,860 weekly spend on Opus across 52 sessions.
+     → tokenmin show model_overspend
+  ...
+```
+
+A rich terminal card with the headline dollar figure, ranked findings,
+severity pills, per-finding next-action. Then `tokenmin show <id>` drills
+into one finding's evidence + fix. Then `tokenmin watch` runs a live
+dashboard while you work.
 
 ## What's in here, what isn't
 
-| Concern | Where it lives |
+| Concern | Where |
 |---|---|
 | Walking `~/.claude` sessions, settings, agents, skills, MCP config | This repo — [`skills/tokenmin/analyzer.py`](skills/tokenmin/analyzer.py) |
 | Parsing claude.ai / Claude Desktop chat exports | This repo — [`skills/tokenmin/analyzer_chat_export.py`](skills/tokenmin/analyzer_chat_export.py) |
 | Anonymization (paths, secrets, labels, identifiers) | This repo — [`skills/tokenmin/anonymize.py`](skills/tokenmin/anonymize.py) |
-| The orchestrator CLI — decides whether to write a snapshot, submit it, or hand off to a local engine | This repo — [`skills/tokenmin/tokenmin.py`](skills/tokenmin/tokenmin.py) |
-| Detection rule base, scoring, report rendering | **Not here.** Lives in the proprietary `watsonrm/tokenmin-core`. |
-| Hosted server | **Not here.** Lives in the F&F preview bundle. |
+| Orchestrator CLI: collect → anonymize → submit → render | This repo — [`skills/tokenmin/tokenmin.py`](skills/tokenmin/tokenmin.py) |
+| Wrapper script + auto-update + version + doctor | This repo — [`tokenmin`](tokenmin) |
+| Tests + CI | This repo — [`tests/`](tests/), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+| **Detection rules**, scoring, report rendering | Not here. Lives in proprietary `watsonrm/tokenmin-core`. |
+| Hosted submission server | Not here. Bundled in the F&F preview. |
 
 This repo is **scanner-only**. Running it produces an anonymized snapshot. It
-does not produce a report (that's the proprietary engine's job). The scanner is
-fully functional without the engine — pass `--snapshot snap.json` to inspect
-what would be sent, and `--out report.md` only works if an engine is also
-installed.
+does *not* produce a report (that's the engine's job). The scanner is fully
+functional without the engine — you can write the snapshot to disk with
+`--snapshot snap.json` and audit what would be sent before deciding to submit
+anywhere.
 
-## Install — verify, then run
+## Install
 
-The audit-first install (no `curl | bash`):
+**Quick** (trusts the network all the way to GitHub):
 
 ```bash
-# 1. fetch the installer and its published checksum
-curl -fsSL -o install.sh https://raw.githubusercontent.com/watsonrm/rmwcommerce/main/tokenmin/install.sh
-curl -fsSL -o install.sh.sha256 https://raw.githubusercontent.com/watsonrm/rmwcommerce/main/tokenmin/install.sh.sha256
+curl --proto '=https' --tlsv1.2 -fsSL https://tokenmin.ai/install.sh | bash
+```
 
-# 2. verify the checksum
+**Verify-then-run** (recommended if you don't trust the network all the way to GitHub):
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL -o install.sh https://tokenmin.ai/install.sh
+curl --proto '=https' --tlsv1.2 -fsSL -o install.sh.sha256 https://tokenmin.ai/install.sh.sha256
 shasum -a 256 -c install.sh.sha256
-
-# 3. (optional but recommended) read the script before running it
 less install.sh
-
-# 4. run it — public-scanner mode, no F&F credentials needed
-TOKENMIN_FF=0 bash install.sh
+bash install.sh
 ```
 
-Quick path (trusts the network all the way to GitHub):
+The installer detects every Claude variant on your machine (Code / Desktop on
+macOS / Linux / Windows), drops a single `tokenmin` command on PATH, and offers
+to add it to your shell rc with consent. No `gh`, no `brew`, no auth setup.
+
+After install:
 
 ```bash
-TOKENMIN_FF=0 curl -fsSL https://raw.githubusercontent.com/watsonrm/rmwcommerce/main/tokenmin/install.sh | bash
+tokenmin --selfcheck      # see the anonymizer rules without reading Python
+tokenmin                  # scan + render inline (the magic moment)
+tokenmin watch            # live dashboard
+tokenmin show <id>        # drill into one finding
+tokenmin help             # 30-second walkthrough
 ```
 
-## Two-minute audit
+## Trust posture
 
-After install, no network calls, no collection:
+### Hashes are HMAC-keyed, not raw SHA-256
 
-```bash
-git clone https://github.com/watsonrm/tokenmin-scanner.git
-cd tokenmin-scanner
-./tokenmin --selfcheck
-```
+Identifiers (file paths, project names, MCP server names, custom agent /
+skill / command names) hash with HMAC-SHA256 keyed by a **32-byte salt
+generated on first run** at `~/.tokenmin/.salt` (chmod 0600, refuses to
+overwrite via `O_EXCL`). Output is 16 hex chars (64 bits) — collision-resistant
+for any realistic corpus.
 
-`--selfcheck` runs the anonymizer over a fixed set of sample inputs and prints
-the scrubbed output as JSON. No collection, no network. It's the literal
-demonstration of "here is what the scrubber does, on inputs designed to expose
-each rule." Reading [`skills/tokenmin/anonymize.py`](skills/tokenmin/anonymize.py)
-in full takes about 5 minutes.
+An adversary who guesses common path names like `~/.ssh/known_hosts` *cannot*
+precompute its hash without your salt. Cross-snapshot correlation works within
+your install (so the engine can flag "same file re-read 12×"); cross-user
+correlation is broken.
 
-Then run a real collection without writing anything off-machine:
+Stricter mode: `TOKENMIN_STRICT_ANONYMIZE=1` adds an additional per-run salt.
+Breaks within-user cross-run correlation too at the cost of losing
+across-days findings.
 
-```bash
-./tokenmin --source code --snapshot my-snapshot.json
-# inspect my-snapshot.json — that's the literal payload that would be sent
-# in hosted mode.
-```
+### Defense-in-depth on inputs
 
-## Honest naming
+Pathological JSONL inputs (oversized lines, regex-bomb strings, malformed
+JSON) can't hang the scrubber: every regex sees inputs truncated to 64 KiB
+max; bad lines are dropped, not raised on; recursion depth is capped.
 
-The output is **pseudonymized**, not strictly anonymous. Hashes are stable
-across runs by default so the engine can correlate ("same file re-read 12×").
-That same stability lets a determined adversary with many snapshots from the
-same user fingerprint them.
+### Audit log
 
-For strict anonymity at the cost of cross-run correlation, set
-`TOKENMIN_STRICT_ANONYMIZE=1` — hashes get salted per-run.
+Every snapshot built + every submission writes a JSON line to
+`~/.tokenmin/audit.log` (chmod 0600) with UTC timestamp, event, and SHA-256
+digest of the payload. **Never user content.** After the fact you can
+reconstruct exactly what bytes you sent and when.
 
-What stays in the snapshot, in full:
+### Transport defaults
 
-- Counts (turns, tool calls, files read, agents spawned)
-- Per-session token usage + USD cost estimate
-- Model names (the Anthropic product names — `claude-opus-4-7`, etc.)
-- Timestamps (start/end of each session)
-- Built-in tool names (Bash, Read, Edit, Agent, Grep, …)
-- Built-in agent names (general-purpose)
+- Default `tokenmin` mode is local — no network calls at all
+- `--submit-url` refuses `http://` for non-localhost
+- `--api-key-env VAR` keeps bearer tokens out of `ps` / shell history
+- `--no-anonymize` requires `--i-know-what-im-doing` AND refuses to combine with `--submit-url`
+- `--snapshot FILE` writes chmod 0600 + refuses to overwrite without `--force`
 
-What gets hashed (whole-string, no suffix leak):
+### Continuous verification
 
-- File paths (Read/Write/Edit `file_path` inputs)
-- Project directory names
-- MCP server names and `mcp__*` tool names
-- Custom agent / skill / command names
-- User-defined `subagent_type` values
+[![CI](https://github.com/watsonrm/tokenmin-scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/watsonrm/tokenmin-scanner/actions/workflows/ci.yml)
 
-What gets stripped:
+Every push runs across Python 3.10 / 3.11 / 3.12:
+- 13 property + CLI tests including idempotent scrub, secret-pattern coverage
+  (Anthropic / OpenAI / Stripe / JWT / npm / Google / AWS / GitHub / Slack),
+  ReDoS input cap, salt sensitivity + stability, HTTPS-only enforcement,
+  double-flag on `--no-anonymize`, chmod 0600 on snapshot writes
+- Deterministic `--selfcheck` output diffed against `tests/fixtures/selfcheck.expected.json`
+- Synthetic-leak gate: builds a fake `~/.claude/` with planted client names + paths,
+  runs the scanner, fails CI if any plaintext survives the scrubber
 
-- `/Users/<name>`, `/home/<name>`, `C:\Users\<name>` (and URL-encoded variants)
-- Mangled Claude Code project paths (`-Users-<name>-...`)
-- Emails, IPs, Anthropic / OpenAI / Stripe / GitHub / Slack / AWS / Google /
-  npm tokens, JWTs, PEM private-key blocks, generic high-entropy strings,
-  bearer tokens
+The F&F bundle mirrors these scanner files; its CI fails if they drift.
+
+### Branch protection
+
+`main` is protected: no force-push, no branch deletion, linear history required.
+
+### Full security policy
+
+[`SECURITY.md`](SECURITY.md) covers threat model, response targets (2-day ack,
+5-day triage, 14-day patch for confirmed high-severity), supported versions,
+named limitations.
+
+## What gets collected, in full
+
+| Field | Form |
+|---|---|
+| Session counts, turn counts | integer |
+| Tool call counts by name | integer per tool name (MCP tool names hashed) |
+| File paths from Read/Write/Edit | whole-string HMAC hash, no suffix leak |
+| Project field, MCP servers, custom agents/skills/commands | whole-string HMAC hash |
+| Models used, token usage, USD cost estimate | as-is (public info) |
+| Permission denies, error results, redo signals | integer count |
+| Timestamps | session start/end |
 
 What never reaches the snapshot:
 
-- Raw message text from user prompts (read in memory for the keyword scan
-  below; discarded immediately)
-- Raw assistant responses
-- Tool call results / outputs
-- Anything outside `~/.claude/` (or, for chat-export mode, anything outside
-  the export blob you point at)
+| Field | Why not |
+|---|---|
+| Raw text of user prompts | only lowercased + keyword-counted in memory for the redo-signal scan, then discarded |
+| Raw assistant responses | scanner never reads them |
+| Tool results | scanner never reads them |
+| Anything outside `~/.claude/` | not in scan scope |
+| Secrets (Anthropic / OpenAI / Stripe / JWT / npm / Google / AWS / GitHub / Slack tokens, PEM blocks, emails, IPs) | scrubbed by `anonymize.py` before any write |
 
-The keyword scan: user-text is lowercased and matched against
-`{"actually", "no wait", "instead", "undo", "revert", "scratch that",
-"never mind", "wrong", "go back"}`. The *count* of matches survives; the
-matched text does not.
+Run `tokenmin --selfcheck` to see the exact anonymization output for a fixed
+set of sample inputs. No collection happens.
 
-## Transport guarantees
+## Roadmap
 
-`tokenmin --out report.md` is 100% local. The only network call is when you
-pass `--submit-url`. That code path:
+The F&F bargain ("free for anonymized data") only works if the install is
+trivial. That's the lead priority.
 
-- Refuses `--submit-url http://...` for non-localhost (HTTPS required).
-- Refuses to combine `--submit-url` with `--no-anonymize`.
-- Prefers `--api-key-env VAR` over `--api-key TOKEN` (CLI token leaks into
-  `ps` and shell history).
+- **Native Claude Desktop adapter** — today Desktop users go through the
+  chat-export path (same as web). Live Electron-store parsing is in progress.
+- **Hosted endpoint** — today the bundled `server/` stub runs locally for
+  testing. A real `https://api.tokenmin.ai/analyze` endpoint with persistence
+  + auth lands when F&F invitees cross ~5 yes-RSVPs.
+- **Engine v0.5 detectors** — cache hit ratio, mid-session `/model` cache flush,
+  output style presence, `ENABLE_TOOL_SEARCH` not set, subagent return-size
+  overruns, 1M-context trap past 256K. (See the public guide for the
+  underlying patterns.)
+- **GPG-signed releases** for `TOKENMIN_REQUIRE_SIGNED=1` users.
+- **One-line installer with embedded signature verification.**
 
-## Auto-update is opt-in
+## Repos
 
-The wrapper script can update the rule base by ff-pulling `origin/main`.
-Defaults:
-
-- `TOKENMIN_AUTOUPDATE=prompt` (default) — interactive: shows
-  "update available, pull?" and skips silently on non-tty.
-- `TOKENMIN_AUTOUPDATE=auto` — unattended.
-- `TOKENMIN_AUTOUPDATE=off` — never check.
-- `TOKENMIN_REQUIRE_SIGNED=1` — only pull commits whose GPG signature
-  verifies locally.
+| Repo | Visibility | Purpose |
+|---|---|---|
+| **`watsonrm/tokenmin-scanner`** (this) | public, Apache-2.0 | scanner + anonymizer + CLI |
+| `watsonrm/tokenmin` | private | F&F preview bundle (mirrors scanner files + ships engine + server) |
+| `watsonrm/tokenmin-core` | private | proprietary engine + rule base + positioning |
+| `watsonrm/tokenmin-site` | public | static site served at https://tokenmin.ai |
 
 ## License
 
 Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The proprietary
-engine lives in `watsonrm/tokenmin-core` under a separate license.
-
-## Repos
-
-| Repo | Public? | What's there |
-|---|---|---|
-| **`watsonrm/tokenmin-scanner`** (this) | Public, Apache-2.0 | Scanner + anonymizer + CLI |
-| `watsonrm/tokenmin` | Private | F&F preview bundle — vendors this scanner + engine + server, clone-and-run |
-| `watsonrm/tokenmin-core` | Private | Proprietary engine + rule base |
+engine in `watsonrm/tokenmin-core` is under a separate, non-OSS license. See
+[`LICENSING.md`](LICENSING.md) for the boundary.
