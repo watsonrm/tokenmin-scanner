@@ -64,6 +64,19 @@ def _dataclass_to_dict(obj):
     return obj
 
 
+def _local_engine_structured():
+    """Return the engine's analyze_structured(snapshot) -> dict, if available.
+
+    Newer engine entry point used by the rich terminal renderer. Falls back to
+    the markdown-only `analyze` via _local_engine() if unavailable.
+    """
+    try:
+        import tokenmin_engine  # type: ignore
+    except ImportError:
+        return None
+    return getattr(tokenmin_engine, "analyze_structured", None)
+
+
 def _local_engine():
     """Return the proprietary local engine if it's installed, else None.
 
@@ -389,6 +402,15 @@ def main(argv: list[str] | None = None) -> int:
         return _print_version()
     if argv and argv[0] == "selftest":
         return _selftest()
+    if argv and argv[0] in ("help", "-h", "--help"):
+        # Custom onboarding help. argparse's --help is still available as `--help-argparse`.
+        if argv[0] == "help" or len(argv) == 1:
+            return _render_help()
+    if argv and argv[0] == "show":
+        if len(argv) < 2:
+            print("usage: tokenmin show <finding-id>", file=sys.stderr)
+            return 2
+        return _render_show(argv[1])
 
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -423,8 +445,16 @@ def main(argv: list[str] | None = None) -> int:
         default=str(Path.home() / ".claude"),
         help="Path to .claude directory (default: ~/.claude) — used with --source code",
     )
-    p.add_argument("--days", type=int, default=30, help="Lookback window in days (default: 30)")
-    p.add_argument("--out", default=None, help="Write the report to this path (default: stdout)")
+    p.add_argument(
+        "--days",
+        default="auto",
+        help='Lookback window in days, or "auto" to adapt to data volume (default: auto)',
+    )
+    p.add_argument(
+        "--out",
+        default=None,
+        help="Write full markdown report to this path. Default behavior is rich inline terminal output.",
+    )
     p.add_argument(
         "--snapshot",
         default=None,
@@ -521,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.submit_url:
         _check_submit_url(args.submit_url)
 
+    # Resolve --days. Accept "auto" (default) or an integer string. For code
+    # source, peek at session count to auto-scale the window.
     if args.source == "code":
         home = Path(args.claude_home).expanduser()
         if not home.exists():
@@ -531,7 +563,10 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        snap = collect_claude_code(home, days=args.days)
+        days = _auto_days(home, args.days)
+        _progress(f"scanning {home}", done=False)
+        snap = collect_claude_code(home, days=days)
+        _progress(f"found {len(snap.sessions)} sessions in last {days} days", done=True)
     elif args.source == "export":
         if not args.from_path:
             print(
@@ -544,24 +579,31 @@ def main(argv: list[str] | None = None) -> int:
         if not export_path.exists():
             print(f"tokenmin: {export_path} does not exist.", file=sys.stderr)
             return 2
-        snap = collect_from_export(export_path, days=args.days)
+        try:
+            days = int(args.days) if args.days != "auto" else 30
+        except (TypeError, ValueError):
+            days = 30
+        _progress(f"reading export {export_path}", done=False)
+        snap = collect_from_export(export_path, days=days)
+        _progress(f"parsed {len(snap.sessions)} conversations", done=True)
     elif args.source == "desktop-native":
-        snap = collect_from_desktop_native(None, days=args.days)
-    else:  # argparse should prevent this
+        snap = collect_from_desktop_native(None, days=30)
+    else:
         print(f"tokenmin: unknown source {args.source!r}", file=sys.stderr)
         return 2
+
     snapshot = _dataclass_to_dict(snap)
     if not args.no_anonymize:
-        # Two-pass scrub: label-hash known identifier fields first, then
-        # free-text scrub the rest (paths, secrets, emails, IPs, ...).
+        _progress("anonymizing", done=False)
         snapshot = _label_scrub_pass(snapshot)
         snapshot = scrub_value(snapshot)
+        _progress("anonymized", done=True)
 
     digest = _payload_digest(snapshot)
     _audit_log(
         "snapshot_built",
         source=args.source,
-        days=args.days,
+        days=snapshot.get("window_days"),
         anonymized=not args.no_anonymize,
         sessions=len(snapshot.get("sessions") or []),
         sha256=digest,
@@ -574,10 +616,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    # --- hosted submit ------------------------------------------------------
     if args.submit_url:
         _audit_log("submit_start", url=args.submit_url, sha256=digest)
         try:
+            _progress(f"submitting to {args.submit_url}", done=False)
             report = _submit(args.submit_url, api_key, snapshot)
+            _progress("submitted", done=True)
         except Exception as exc:
             _audit_log("submit_error", url=args.submit_url, error=str(exc)[:200])
             raise
@@ -585,21 +630,341 @@ def main(argv: list[str] | None = None) -> int:
         _emit_report(report, args.out)
         return 0
 
-    engine = _local_engine()
-    if engine is not None:
-        _emit_report(engine(snapshot), args.out)
+    # --- local engine (preferred new path: analyze_structured) -------------
+    structured_engine = _local_engine_structured()
+    if structured_engine is not None:
+        _progress("analyzing", done=False)
+        result = structured_engine(snapshot)
+        _progress("analyzed", done=True)
+        _save_last_run(result)
+
+        # Output mode: file = markdown; otherwise = rich inline.
+        if args.out:
+            _emit_report(result.get("report_md", ""), args.out)
+        else:
+            _render_terminal(result)
         return 0
 
-    # No engine available: the open client did its job (collect + anonymize).
-    msg = (
+    # --- fallback: legacy analyze() returning markdown only -----------------
+    engine = _local_engine()
+    if engine is not None:
+        md = engine(snapshot)
+        _emit_report(md, args.out)
+        return 0
+
+    # --- no engine: scanner-only mode --------------------------------------
+    msg_lines = [
         "tokenmin: anonymized snapshot ready"
-        + (f" at {args.snapshot}" if args.snapshot else " (pass --snapshot PATH to save it)")
-        + ".\nNo Tokenmin engine found. Install the local engine, or pass "
-        "--submit-url to use the hosted service, to turn this snapshot into a report.\n"
-        "The open client holds no detection rules — see LICENSING.md.\n"
-    )
-    print(msg, file=sys.stderr)
+        + (f" at {args.snapshot}." if args.snapshot else " (pass --snapshot PATH to save it)."),
+        "No Tokenmin engine found on this install — you're running scanner-only mode.",
+        "",
+        "  next:  tokenmin --snapshot snap.json     # see exactly what would be sent",
+        "         tokenmin --submit-url HTTPS_URL   # hand off to a hosted engine",
+        "",
+        "The scanner holds no detection rules by design — see LICENSING.md.",
+        "For the full report, ask Rick for an F&F invite at https://tokenmin.ai",
+    ]
+    print("\n".join(msg_lines), file=sys.stderr)
     return 0
+
+
+# --- terminal rendering ----------------------------------------------------
+
+# ANSI codes. Disabled automatically when stdout isn't a tty or NO_COLOR is set.
+def _ansi_supported() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+class _C:
+    """ANSI color/style codes, no-op when ANSI is unsupported."""
+    def __init__(self, enable: bool):
+        self.RESET = "\033[0m" if enable else ""
+        self.BOLD = "\033[1m" if enable else ""
+        self.DIM = "\033[2m" if enable else ""
+        self.RED = "\033[31m" if enable else ""
+        self.GREEN = "\033[32m" if enable else ""
+        self.YELLOW = "\033[33m" if enable else ""
+        self.BLUE = "\033[34m" if enable else ""
+        self.MAGENTA = "\033[35m" if enable else ""
+        self.CYAN = "\033[36m" if enable else ""
+        self.GRAY = "\033[90m" if enable else ""
+
+
+def _fmt_money(x: float) -> str:
+    if x >= 1000:
+        return f"${x:,.0f}"
+    if x >= 10:
+        return f"${x:.0f}"
+    return f"${x:.2f}"
+
+
+def _severity(savings: float) -> tuple[str, str, str]:
+    """Returns (pill_text, color_code_attr, label) for a finding's $/mo."""
+    if savings >= 500: return ("$$$$", "RED", "critical")
+    if savings >= 100: return ("$$$", "YELLOW", "high")
+    if savings >= 25:  return ("$$",  "CYAN", "medium")
+    return ("$",  "GRAY", "low")
+
+
+def _bar(ratio: float, width: int = 10) -> str:
+    """Unicode bar showing 0..1 ratio over `width` cells."""
+    ratio = max(0.0, min(1.0, ratio))
+    filled = round(ratio * width)
+    return "▮" * filled + "▯" * (width - filled)
+
+
+# Lever / pillar labels for human-readable finding metadata.
+_PILLAR_LABELS = {
+    "1": "context discipline",
+    "2": "model routing",
+    "3": "parallelism / MCP",
+    "4": "density of expression",
+    "hygiene": "hygiene",
+}
+
+# Static comparison anchors per finding id. Keep terse; one-liners.
+_ANCHORS: dict[str, str] = {
+    "no_global_claude_md": "Anthropic recommends a global CLAUDE.md so Claude starts each project with your conventions loaded.",
+    "oversized_claude_md": "Anthropic guidance: under 200 lines per CLAUDE.md. Past 200, adherence drops.",
+    "obsolete_references": "These features don't exist. Claude will silently ignore them.",
+    "long_sessions_no_clear": "Context window fills fast. Claude Code docs: use /clear between unrelated tasks; /compact near 50%.",
+    "no_hooks": "Hooks let Claude react to events (SessionStart, file edits, permission denies).",
+    "repeated_file_reads": "Each re-read costs ~3K tokens at sonnet input rates. Reference with @path or cache via CLAUDE.md hints.",
+    "no_custom_agents": "Subagents run in their own context; verbose work never pollutes your main session.",
+    "high_redo_signal": "Course-corrections mean Claude shipped plausible-but-wrong. Plan Mode + failing-test-first cuts the loop.",
+    "long_searches": "Vague asks burn tokens on exploration. Add a 'where things live' map to CLAUDE.md.",
+    "no_mcp": "MCP servers let Claude call external services natively, eliminating HTTP-explaining overhead.",
+    "model_overspend": "Haiku is ~15x cheaper than Opus on input AND output. Route mechanical work to Haiku, complex reasoning to Opus.",
+}
+
+
+def _render_terminal(result: dict) -> None:
+    """Print the inline headline card + ranked findings card. The 'magic moment'."""
+    c = _C(_ansi_supported())
+    snap = result.get("snapshot", {})
+    findings = result.get("findings") or []
+    total_save = result.get("total_savings_usd_per_month", 0.0)
+    total_eff = result.get("total_hours_to_implement", 0.0)
+    cost = snap.get("total_cost_usd", 0.0)
+    sessions = snap.get("sessions", 0)
+    days = snap.get("window_days", 0)
+    models = snap.get("models") or []
+    models_line = "  ·  ".join(f"{m['name']} {round(m['share']*100)}%" for m in models[:3]) or "no model data"
+
+    line = "─" * 72
+
+    # Header card.
+    print()
+    print(f"  {c.BOLD}{c.MAGENTA}Tokenmin{c.RESET}  Claude usage audit")
+    print(f"  {c.GRAY}{line}{c.RESET}")
+    print(f"  scanned {c.BOLD}{sessions}{c.RESET} sessions over {days} days")
+    print(f"  est. spend (window): {c.BOLD}{_fmt_money(cost)}{c.RESET}")
+    print(f"  model mix: {c.DIM}{models_line}{c.RESET}")
+    print(f"  {c.GRAY}{line}{c.RESET}")
+    print()
+
+    if not findings:
+        print(f"  {c.GREEN}✓{c.RESET} no findings — your setup looks clean")
+        if sessions < 5:
+            print(f"  {c.YELLOW}note: only {sessions} session(s) in window; rerun after more use{c.RESET}")
+        _print_next_steps(c, [])
+        return
+
+    # Headline.
+    print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(total_save)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
+    print()
+
+    max_save = max((f["savings_usd_per_month"] for f in findings), default=1.0) or 1.0
+
+    for i, f in enumerate(findings, 1):
+        save = f["savings_usd_per_month"]
+        pill, color_attr, _ = _severity(save)
+        pill_color = getattr(c, color_attr)
+        rel = save / max_save if max_save > 0 else 0
+        pillar = _PILLAR_LABELS.get(f.get("pillar", ""), "")
+        conf = int(f.get("confidence", 0) * 100)
+        hrs = f.get("hours_to_implement", 0.0)
+
+        print(f"  {c.BOLD}{i}.{c.RESET} {c.BOLD}{f['title']}{c.RESET}")
+        print(f"     {pill_color}{pill:<5}{c.RESET}  {_bar(rel)}  {c.BOLD}{_fmt_money(save)}/mo{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
+        print(f"     {c.DIM}evidence:{c.RESET} {f.get('evidence', '')}")
+        print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {f['id']}{c.RESET}")
+        print()
+
+    _print_next_steps(c, findings)
+
+
+def _print_next_steps(c: "_C", findings: list) -> None:
+    print(f"  {c.GRAY}─" * 36 + f"{c.RESET}")
+    print(f"  next steps:")
+    if findings:
+        print(f"    {c.BOLD}tokenmin show <id>{c.RESET}    drill into one finding")
+    print(f"    {c.BOLD}tokenmin --out report.md{c.RESET}  write the full markdown report")
+    print(f"    {c.BOLD}tokenmin help{c.RESET}             30-second walkthrough")
+    print(f"    {c.GRAY}guide: https://tokenmin.ai/guides/claude-token-optimization{c.RESET}")
+    print()
+
+
+def _render_show(finding_id: str) -> int:
+    """Drill-down into one finding. Reads last_run.json."""
+    c = _C(_ansi_supported())
+    last = _load_last_run()
+    if not last:
+        print("tokenmin show: no recent run found.", file=sys.stderr)
+        print("  run `tokenmin` first to produce findings, then `tokenmin show <id>`.", file=sys.stderr)
+        return 2
+    findings = last.get("findings") or []
+    found = next((f for f in findings if f["id"] == finding_id), None)
+    if not found:
+        print(f"tokenmin show: no finding with id '{finding_id}' in last run.", file=sys.stderr)
+        if findings:
+            print("  available findings:", file=sys.stderr)
+            for f in findings:
+                print(f"    {f['id']}", file=sys.stderr)
+        return 2
+
+    save = found["savings_usd_per_month"]
+    pill, color_attr, label = _severity(save)
+    pill_color = getattr(c, color_attr)
+    pillar = _PILLAR_LABELS.get(found.get("pillar", ""), "hygiene")
+    conf = int(found.get("confidence", 0) * 100)
+    hrs = found.get("hours_to_implement", 0.0)
+
+    print()
+    print(f"  {c.BOLD}{c.MAGENTA}{found['title']}{c.RESET}")
+    print(f"  {c.GRAY}finding id: {found['id']}{c.RESET}")
+    print()
+    print(f"  Severity  {pill_color}{pill}{c.RESET} ({label})")
+    print(f"  Impact    {c.BOLD}{_fmt_money(save)}/mo{c.RESET} estimated savings")
+    print(f"  Effort    {hrs:.1f} hrs to implement")
+    print(f"  Pillar    {pillar}")
+    print(f"  Confidence {conf}%")
+    print()
+    print(f"  {c.BOLD}Evidence{c.RESET}")
+    print(f"  {found.get('evidence', '')}")
+    anchor = _ANCHORS.get(found["id"])
+    if anchor:
+        print()
+        print(f"  {c.BOLD}Why this matters{c.RESET}")
+        print(f"  {c.DIM}{anchor}{c.RESET}")
+    print()
+    print(f"  {c.BOLD}How to fix{c.RESET}")
+    # Render how_to_fix as-is (it's already markdown-flavored copy).
+    for line in (found.get("how_to_fix", "") or "").splitlines():
+        print(f"  {line}")
+    print()
+    return 0
+
+
+def _render_help() -> int:
+    """30-second walkthrough that replaces the bare argparse dump."""
+    c = _C(_ansi_supported())
+    print()
+    print(f"  {c.BOLD}{c.MAGENTA}Tokenmin{c.RESET}  Claude usage advisor")
+    print()
+    print(f"  Reads how you use Claude, anonymizes it, and shows you what to fix next.")
+    print()
+    print(f"  {c.BOLD}First run{c.RESET}")
+    print(f"    {c.CYAN}tokenmin{c.RESET}                      scan, anonymize, show findings inline")
+    print()
+    print(f"  {c.BOLD}Drill into one finding{c.RESET}")
+    print(f"    {c.CYAN}tokenmin show <id>{c.RESET}            full evidence + the fix")
+    print()
+    print(f"  {c.BOLD}Variants{c.RESET}")
+    print(f"    {c.CYAN}tokenmin --source export --from FILE{c.RESET}    audit claude.ai or Desktop export")
+    print(f"    {c.CYAN}tokenmin --out report.md{c.RESET}                write full markdown report")
+    print(f"    {c.CYAN}tokenmin --snapshot snap.json{c.RESET}           inspect anonymized payload")
+    print(f"    {c.CYAN}tokenmin --submit-url URL{c.RESET}               send to hosted engine (HTTPS only)")
+    print()
+    print(f"  {c.BOLD}Maintenance{c.RESET}")
+    print(f"    {c.CYAN}tokenmin --version{c.RESET}            what you're running")
+    print(f"    {c.CYAN}tokenmin doctor{c.RESET}               self-diagnose")
+    print(f"    {c.CYAN}tokenmin selftest{c.RESET}             run the bundled tests")
+    print(f"    {c.CYAN}tokenmin uninstall{c.RESET}            clean removal")
+    print()
+    print(f"  {c.BOLD}What gets collected and what doesn't{c.RESET}")
+    print(f"    {c.GRAY}collected (hashed):{c.RESET} file paths, project names, MCP server names,")
+    print(f"      custom agent/skill/command names, model names, token counts, timestamps")
+    print(f"    {c.GRAY}never collected:{c.RESET} message text, tool outputs, anything outside ~/.claude/")
+    print()
+    print(f"  {c.BOLD}Trust posture{c.RESET}")
+    print(f"    Apache-2.0 scanner: github.com/watsonrm/tokenmin-scanner")
+    print(f"    Threat model + disclosure: SECURITY.md in that repo")
+    print(f"    {c.CYAN}tokenmin --selfcheck{c.RESET}          verify the anonymizer rules")
+    print()
+    print(f"  Full guide: {c.BLUE}https://tokenmin.ai/guides/claude-token-optimization{c.RESET}")
+    print()
+    return 0
+
+
+# --- last-run cache (for tokenmin show) ------------------------------------
+
+def _last_run_path() -> Path:
+    return Path.home() / ".tokenmin" / "last_run.json"
+
+
+def _save_last_run(result: dict) -> None:
+    """Persist the structured run for later `tokenmin show <id>`."""
+    path = _last_run_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot": result.get("snapshot", {}),
+        "findings": result.get("findings", []),
+        "total_savings_usd_per_month": result.get("total_savings_usd_per_month", 0.0),
+        "engine_version": result.get("engine_version", ""),
+    }
+    data = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(path))
+
+
+def _load_last_run() -> dict | None:
+    try:
+        return json.loads(_last_run_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# --- progress indicator ----------------------------------------------------
+
+def _progress(msg: str, done: bool = False) -> None:
+    """Print a progress line to stderr. Skipped in quiet mode (--out, --snapshot, --submit-url paths can suppress)."""
+    if os.environ.get("TOKENMIN_QUIET") == "1":
+        return
+    marker = "✓" if done else "▶"
+    c = _C(_ansi_supported())
+    print(f"  {c.DIM}{marker} {msg}{c.RESET}", file=sys.stderr)
+
+
+# --- smart defaults --------------------------------------------------------
+
+def _auto_days(claude_home: Path, requested: str | int) -> int:
+    """Adaptive window based on data volume. Override with --days N.
+
+    Scales:
+      - <  5 .jsonl files       -> 90 days (cast a wide net)
+      - 5-50 files              -> 30 days (default)
+      - > 50 files              -> 14 days (recent only)
+    """
+    if requested != "auto":
+        return int(requested)
+    proj_dir = claude_home / "projects"
+    if not proj_dir.is_dir():
+        return 30
+    n = sum(1 for _ in proj_dir.rglob("*.jsonl"))
+    if n < 5:
+        return 90
+    if n > 50:
+        return 14
+    return 30
 
 
 def _selftest() -> int:
