@@ -673,6 +673,37 @@ def main(argv: list[str] | None = None) -> int:
 # --- terminal rendering ----------------------------------------------------
 
 # ANSI codes. Disabled automatically when stdout isn't a tty or NO_COLOR is set.
+_CONTROL_CHARS_RE = None  # lazy-compiled
+
+
+def _strip_ctl(s: str) -> str:
+    """Remove ANSI escape sequences and other control characters from a display
+    string. Defense against adversarial filenames / project dirs / external
+    inputs that could inject screen-clear, title-set, or fake-prompt sequences
+    into our renderers.
+
+    Keeps tab + newline (those are legitimate display characters); strips all
+    other C0/C1 controls and CSI/OSC escape sequences.
+    """
+    global _CONTROL_CHARS_RE
+    if _CONTROL_CHARS_RE is None:
+        import re as _re
+        # ANSI CSI: ESC [ ... letter
+        # ANSI OSC: ESC ] ... BEL or ESC \\
+        # Other ESC sequences: ESC <anything-single-char>
+        # C0 control chars except \t and \n
+        # C1 control chars (0x80-0x9F)
+        _CONTROL_CHARS_RE = _re.compile(
+            r"\x1B\[[0-?]*[ -/]*[@-~]"           # CSI
+            r"|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)"  # OSC
+            r"|\x1B[@-Z\\-_]"                    # other ESC sequences
+            r"|[\x00-\x08\x0B-\x1F\x7F-\x9F]"    # C0 (sans \t \n) + DEL + C1
+        )
+    if not isinstance(s, str):
+        return s
+    return _CONTROL_CHARS_RE.sub("", s)
+
+
 def _ansi_supported() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
@@ -795,10 +826,17 @@ def _render_terminal(result: dict) -> None:
         conf = int(f.get("confidence", 0) * 100)
         hrs = f.get("hours_to_implement", 0.0)
 
-        print(f"  {c.BOLD}{i}.{c.RESET} {c.BOLD}{f['title']}{c.RESET}")
+        # Strip control chars from anything that came from the engine — defense
+        # against ANSI injection through finding titles/evidence/ids if an
+        # adversary planted them in source data.
+        title = _strip_ctl(f["title"])
+        evidence = _strip_ctl(f.get("evidence", ""))
+        finding_id = _strip_ctl(f["id"])
+
+        print(f"  {c.BOLD}{i}.{c.RESET} {c.BOLD}{title}{c.RESET}")
         print(f"     {pill_color}{pill:<5}{c.RESET}  {_bar(rel)}  {c.BOLD}{_fmt_money(save)}/mo{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
-        print(f"     {c.DIM}evidence:{c.RESET} {f.get('evidence', '')}")
-        print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {f['id']}{c.RESET}")
+        print(f"     {c.DIM}evidence:{c.RESET} {evidence}")
+        print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {finding_id}{c.RESET}")
         print()
 
     _print_next_steps(c, findings)
@@ -840,9 +878,14 @@ def _render_show(finding_id: str) -> int:
     conf = int(found.get("confidence", 0) * 100)
     hrs = found.get("hours_to_implement", 0.0)
 
+    title = _strip_ctl(found["title"])
+    fid = _strip_ctl(found["id"])
+    evidence = _strip_ctl(found.get("evidence", ""))
+    how_to_fix = _strip_ctl(found.get("how_to_fix", "") or "")
+
     print()
-    print(f"  {c.BOLD}{c.MAGENTA}{found['title']}{c.RESET}")
-    print(f"  {c.GRAY}finding id: {found['id']}{c.RESET}")
+    print(f"  {c.BOLD}{c.MAGENTA}{title}{c.RESET}")
+    print(f"  {c.GRAY}finding id: {fid}{c.RESET}")
     print()
     print(f"  Severity  {pill_color}{pill}{c.RESET} ({label})")
     print(f"  Impact    {c.BOLD}{_fmt_money(save)}/mo{c.RESET} estimated savings")
@@ -851,7 +894,7 @@ def _render_show(finding_id: str) -> int:
     print(f"  Confidence {conf}%")
     print()
     print(f"  {c.BOLD}Evidence{c.RESET}")
-    print(f"  {found.get('evidence', '')}")
+    print(f"  {evidence}")
     anchor = _ANCHORS.get(found["id"])
     if anchor:
         print()
@@ -859,8 +902,7 @@ def _render_show(finding_id: str) -> int:
         print(f"  {c.DIM}{anchor}{c.RESET}")
     print()
     print(f"  {c.BOLD}How to fix{c.RESET}")
-    # Render how_to_fix as-is (it's already markdown-flavored copy).
-    for line in (found.get("how_to_fix", "") or "").splitlines():
+    for line in how_to_fix.splitlines():
         print(f"  {line}")
     print()
     return 0
@@ -1039,10 +1081,29 @@ def _parse_session_live(path: Path) -> dict:
         "est_cost_usd": 0.0,
         "size_bytes": 0,
     }
+    # Defense against adversarial JSONL: skip files > 50 MiB outright and
+    # cap per-line reads at 1 MiB via readline(maxsize). Without this, a
+    # single multi-GB line would OOM Python during the `for line in f` read.
+    _MAX_FILE = 50 * 1024 * 1024
+    _MAX_LINE = 1024 * 1024
     try:
         stats["size_bytes"] = path.stat().st_size
+        if stats["size_bytes"] > _MAX_FILE:
+            return stats  # file too large to safely live-parse
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            while True:
+                line = f.readline(_MAX_LINE)
+                if not line:
+                    break  # EOF
+                # If we hit the size cap without a newline, discard the rest
+                # of this "line" so the next readline starts fresh.
+                if len(line) == _MAX_LINE and not line.endswith("\n"):
+                    # Skip ahead to the next newline (bounded read).
+                    while True:
+                        chunk = f.readline(_MAX_LINE)
+                        if not chunk or chunk.endswith("\n"):
+                            break
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -1210,7 +1271,7 @@ def _watch(args: list[str]) -> int:
                 duration = _fmt_duration(active["started_at"], active["last_at"])
 
                 print()
-                print(f"  {c.BOLD}Active session{c.RESET}  {c.DIM}{active['project'][:50]}{c.RESET}")
+                print(f"  {c.BOLD}Active session{c.RESET}  {c.DIM}{_strip_ctl(active['project'])[:50]}{c.RESET}")
                 print(f"    started   {started_iso}    duration {duration}    last activity {last_iso}")
                 print()
 
@@ -1235,7 +1296,7 @@ def _watch(args: list[str]) -> int:
                 if active["models"]:
                     total_calls = sum(active["models"].values())
                     model_line = "  ·  ".join(
-                        f"{m.split('-')[1].title() if '-' in m else m} {round(100*n/total_calls)}%"
+                        f"{_strip_ctl(m.split('-')[1].title() if '-' in m else m)} {round(100*n/total_calls)}%"
                         for m, n in active["models"].most_common(3)
                     )
                     print(f"  {c.BOLD}Models{c.RESET}        {model_line}")
@@ -1244,7 +1305,7 @@ def _watch(args: list[str]) -> int:
                 if active["tool_calls"]:
                     total_t = sum(active["tool_calls"].values())
                     tool_line = "  ·  ".join(
-                        f"{name} {round(100*n/total_t)}%"
+                        f"{_strip_ctl(name)} {round(100*n/total_t)}%"
                         for name, n in active["tool_calls"].most_common(5)
                     )
                     print(f"  {c.BOLD}Tools{c.RESET}         {tool_line}")
@@ -1270,7 +1331,7 @@ def _watch(args: list[str]) -> int:
                     save = f["savings_usd_per_month"]
                     pill, color_attr, _ = _severity(save)
                     pill_color = getattr(c, color_attr)
-                    print(f"    {i}. {pill_color}{pill:<4}{c.RESET} {_fmt_money(save)}/mo  {f['title'][:60]}")
+                    print(f"    {i}. {pill_color}{pill:<4}{c.RESET} {_fmt_money(save)}/mo  {_strip_ctl(f['title'])[:60]}")
                 print()
             else:
                 print(f"  {c.DIM}(run `tokenmin` once to populate top findings here){c.RESET}")

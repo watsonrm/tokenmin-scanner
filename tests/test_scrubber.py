@@ -144,6 +144,34 @@ class PropertyTests(unittest.TestCase):
             b = self._run_selfcheck(salt_path)
             self.assertEqual(a["labels"], b["labels"], "stable salt produced different hashes")
 
+    def test_strip_ctl_blocks_ansi_injection(self):
+        """ANSI escape codes and control chars get stripped from displayed text.
+        Defense against adversarial filenames / project dirs that could hijack
+        the terminal via escape sequences planted by an attacker with write
+        access to ~/.claude/projects/."""
+        import importlib
+        # Import lazily — _strip_ctl lives in tokenmin.py which is also a CLI
+        # script; tests/run.sh adds it to sys.path.
+        sys.path.insert(0, str(SKILL_DIR))
+        tokenmin_mod = importlib.import_module("tokenmin")
+        cases = [
+            ("clean", "clean"),
+            ("\x1b[2Jhello", "hello"),                         # CSI screen-clear
+            ("\x1b[31mred\x1b[0m", "red"),                     # CSI color
+            ("title\x1b]2;HACKED\x07", "title"),               # OSC window-title
+            ("title\x1b]0;X\x1b\\", "title"),                  # OSC with ST terminator
+            ("with\x00null\x07bell", "withnullbell"),          # C0 controls
+            ("tab\there", "tab\there"),                        # tab preserved
+            ("line\nbreak", "line\nbreak"),                    # newline preserved
+            ("c1\x9bcontrol", "c1control"),                    # C1 controls
+            ("", ""),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(
+                tokenmin_mod._strip_ctl(raw), expected,
+                f"_strip_ctl({raw!r}) -> got {tokenmin_mod._strip_ctl(raw)!r}, want {expected!r}",
+            )
+
     def test_redos_input_cap(self):
         """Pathologically long input is truncated rather than hanging the scrubber."""
         import time

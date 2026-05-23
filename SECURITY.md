@@ -99,6 +99,21 @@ Every run appends a JSON line to `~/.tokenmin/audit.log` (mode 0600):
 
 The log records *what was sent* (by SHA-256 of the payload), *where*, and *when* — never user content. You can always reconstruct your submission history.
 
+## Recent hardening — v0.8 security re-scan (2026-05-23)
+
+After shipping the install-path rewrite (v0.5), B2 client redesign (v0.5–0.7),
+`tokenmin watch` (v0.6), and the engine v0.5 detectors (v0.7), we ran a
+red-team pass against the new surfaces. Findings + resolutions:
+
+| # | Surface | Finding | Resolution |
+|---|---|---|---|
+| R1 | Install path + auto-update | `TOKENMIN_TOKEN`-installed F&F users had their token scrubbed from `.git/config` after clone — auto-update against private repos then failed silently | Installer now writes a per-install git credential helper file (`<install>/.git-credentials`, chmod 0600) and points `credential.helper` at it. Token is no longer in `.git/config` (not visible to `git config --list`) but auto-update works. |
+| R2 | Terminal renderer + `tokenmin watch` | An adversary who could write to `~/.claude/projects/<dir>` could plant ANSI escape sequences in project / file / tool names that hijacked the user's terminal (clear screen, set title, fake prompt) when rendered | New `_strip_ctl()` helper removes ANSI CSI / OSC sequences, C0 + C1 control chars (preserving tab + newline). Applied to every displayed string in `_render_terminal`, `_render_show`, and `_watch`. Property test in `tests/test_scrubber.py`. |
+| R3 | `tokenmin watch` + `analyzer.py` JSONL parsers | A single multi-GB line in a planted session file would OOM Python during `for line in f` iteration | Both parsers now `readline(maxsize=1 MiB)` per line and skip files > 50 MiB outright. Bounded-discard logic skips ahead to the next newline on oversized lines. |
+| R4 | `tokenmin.ai/i/<code>/` per-user invite paths | Risk that GH Pages directory listing on `/i/` would let attackers enumerate invite codes | Verified: GH Pages returns HTTP 404 on bare directories — no listing. No code change needed. |
+
+CI test count: 13 → 14 (added `test_strip_ctl_blocks_ansi_injection`).
+
 ## Cryptographic primitives
 
 | Use | Primitive |

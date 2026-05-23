@@ -5,3 +5,4 @@ __pycache__/
 # test fixtures like tests/fixtures/test.salt aren't blocked).
 /.salt
 /audit.log
+/.git-credentials

@@ -130,10 +130,29 @@ _REDO_HINTS = (
 _LONG_SEARCH_TOOLS = {"Grep", "Glob", "find", "Bash"}
 
 
+_MAX_JSONL_FILE = 50 * 1024 * 1024   # skip files > 50 MiB outright
+_MAX_JSONL_LINE = 1024 * 1024        # cap per-line read at 1 MiB
+
+
 def _safe_jsonl(path: Path):
+    """Defense against adversarial JSONL: bounded per-line + per-file reads.
+    Without these caps, a single multi-GB line in a planted session file
+    would OOM Python during the iter-lines read."""
     try:
+        if path.stat().st_size > _MAX_JSONL_FILE:
+            return
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            while True:
+                line = f.readline(_MAX_JSONL_LINE)
+                if not line:
+                    return
+                if len(line) == _MAX_JSONL_LINE and not line.endswith("\n"):
+                    # Oversized line — discard up to the next newline (bounded).
+                    while True:
+                        chunk = f.readline(_MAX_JSONL_LINE)
+                        if not chunk or chunk.endswith("\n"):
+                            break
+                    continue
                 line = line.strip()
                 if not line:
                     continue
