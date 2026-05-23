@@ -1,0 +1,23 @@
+{
+	"name": "tokenmin",
+	"owner": {
+		"name": "Rick Watson",
+		"email": "rick@rmwcommerce.com"
+	},
+	"plugins": [
+		{
+			"name": "tokenmin",
+			"source": "./",
+			"description": "Tokenmin scanner — Apache-2.0 collector + anonymizer for Claude usage. Audit-able by design. Detection engine is separately licensed (watsonrm/tokenmin-core).",
+			"version": "0.3.0",
+			"author": {
+				"name": "Rick Watson",
+				"email": "rick@rmwcommerce.com"
+			},
+			"repository": "https://github.com/watsonrm/tokenmin-scanner",
+			"license": "Apache-2.0",
+			"keywords": ["claude-code", "optimizer", "autonomous", "advisor", "agent", "skill"],
+			"skills": ["./skills/"]
+		}
+	]
+}

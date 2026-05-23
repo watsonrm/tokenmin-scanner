@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Tokenmin F&F preview wrapper.
+# Wires the bundled engine onto PYTHONPATH and runs the open client.
+# The open client (skills/tokenmin/) is Apache-2.0; the engine (engine/) is
+# proprietary. See README.md + LICENSING.md.
+set -euo pipefail
+# Resolve through symlinks — the one-line installer symlinks this script onto
+# PATH, so BASH_SOURCE points at the link, not the real install dir.
+src="${BASH_SOURCE[0]}"
+while [ -L "${src}" ]; do
+  src_dir="$(cd "$(dirname "${src}")" && pwd)"
+  src="$(readlink "${src}")"
+  [[ "${src}" != /* ]] && src="${src_dir}/${src}"
+done
+here="$(cd "$(dirname "${src}")" && pwd)"
+
+# Auto rule-upgrade. Per red-team: arbitrary `git pull` on every run is a
+# supply-chain risk if maintainer creds are ever compromised. Defaults:
+#
+#   TOKENMIN_AUTOUPDATE=prompt   show "there's an update; pull? (y/N)" — default
+#   TOKENMIN_AUTOUPDATE=auto     unattended fast-forward, no prompt
+#   TOKENMIN_AUTOUPDATE=off      never check
+#
+#   TOKENMIN_REQUIRE_SIGNED=1    only pull commits whose signature verifies
+#                                against the local gpg keyring (skipped if
+#                                git doesn't return a 'G' verify-commit code)
+#
+#   TOKENMIN_UPDATE_INTERVAL_HOURS=N  check at most every N hours (default 24)
+#
+# Skips silently on no-network / non-git / dirty tree — never blocks the run.
+maybe_update() {
+  local mode="${TOKENMIN_AUTOUPDATE:-prompt}"
+  [ "${mode}" = "off" ] && return 0
+  [ -d "${here}/.git" ] || return 0
+  command -v git >/dev/null 2>&1 || return 0
+  local stamp="${here}/.last-update-check"
+  local now ; now="$(date +%s)"
+  local interval="${TOKENMIN_UPDATE_INTERVAL_HOURS:-24}"
+  local max_age=$(( interval * 3600 ))
+  if [ -f "${stamp}" ]; then
+    local last ; last="$(cat "${stamp}" 2>/dev/null || echo 0)"
+    [ "$(( now - last ))" -lt "${max_age}" ] && return 0
+  fi
+  echo "${now}" > "${stamp}" 2>/dev/null || true
+  if ! timeout 5 git -C "${here}" fetch --quiet origin main 2>/dev/null; then
+    return 0
+  fi
+  local local_sha remote_sha
+  local_sha="$(git -C "${here}" rev-parse HEAD 2>/dev/null || echo)"
+  remote_sha="$(git -C "${here}" rev-parse FETCH_HEAD 2>/dev/null || echo)"
+  [ -z "${local_sha}" ] || [ -z "${remote_sha}" ] && return 0
+  [ "${local_sha}" = "${remote_sha}" ] && return 0
+  if [ -n "$(git -C "${here}" status --porcelain 2>/dev/null)" ]; then
+    printf "tokenmin: update available (%s) but local tree has changes; skipping.\n" "${remote_sha:0:7}" >&2
+    return 0
+  fi
+  # Optional signature verification.
+  if [ "${TOKENMIN_REQUIRE_SIGNED:-0}" = "1" ]; then
+    local verify
+    verify="$(git -C "${here}" log -1 --pretty=%G? FETCH_HEAD 2>/dev/null || echo N)"
+    if [ "${verify}" != "G" ] && [ "${verify}" != "U" ]; then
+      printf "tokenmin: update available (%s) but commit signature did not verify (%s); skipping.\n" "${remote_sha:0:7}" "${verify}" >&2
+      return 0
+    fi
+  fi
+  if [ "${mode}" = "prompt" ]; then
+    # Only prompt if stderr is a tty; non-interactive runs skip silently.
+    if [ -t 2 ]; then
+      printf "tokenmin: update available (%s -> %s). Pull now? [y/N] " "${local_sha:0:7}" "${remote_sha:0:7}" >&2
+      local answer
+      read -r answer < /dev/tty || answer=""
+      case "${answer}" in y|Y|yes|YES) ;; *) return 0 ;; esac
+    else
+      printf "tokenmin: update available (%s -> %s). Run interactively or set TOKENMIN_AUTOUPDATE=auto to apply.\n" "${local_sha:0:7}" "${remote_sha:0:7}" >&2
+      return 0
+    fi
+  fi
+  if git -C "${here}" merge --ff-only --quiet FETCH_HEAD 2>/dev/null; then
+    printf "tokenmin: updated rule base to %s\n" "${remote_sha:0:7}" >&2
+  fi
+}
+maybe_update
+
+export PYTHONPATH="${here}/engine:${here}/skills/tokenmin${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 "${here}/skills/tokenmin/tokenmin.py" "$@"

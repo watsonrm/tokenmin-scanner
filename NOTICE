@@ -1,0 +1,15 @@
+Tokenmin (open client)
+Copyright 2026 Rick Watson
+
+This product includes the Tokenmin open client: the collector, the anonymizer,
+and the submission/transport layer. It is licensed under the Apache License,
+Version 2.0 (see LICENSE).
+
+The Tokenmin processing engine, detection rule base, report rendering, and server
+infrastructure are NOT part of this distribution. They are proprietary, "all
+rights reserved," and maintained in a separate repository. See LICENSING.md
+for the boundary between the open client and the proprietary core.
+
+"Tokenmin" and the Tokenmin name are used to identify this project; this License does
+not grant permission to use the project's marks except as required for
+reasonable and customary use in describing the origin of the work.
