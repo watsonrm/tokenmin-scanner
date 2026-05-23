@@ -739,6 +739,12 @@ _ANCHORS: dict[str, str] = {
     "long_searches": "Vague asks burn tokens on exploration. Add a 'where things live' map to CLAUDE.md.",
     "no_mcp": "MCP servers let Claude call external services natively, eliminating HTTP-explaining overhead.",
     "model_overspend": "Haiku is ~15x cheaper than Opus on input AND output. Route mechanical work to Haiku, complex reasoning to Opus.",
+    # v0.5 detectors
+    "low_cache_hit_ratio": "Anthropic's Claude Code engineering team: 'a few percentage points of cache miss rate can dramatically affect cost and latency.' Cache reads bill at 0.1x input rate. Target >90% on repeated workloads.",
+    "multi_model_sessions": "Each /model switch reprocesses the full session history at full input rate. opusplan plan-mode toggles count too. Pick one model per session; /clear to start fresh.",
+    "no_output_style": "Claude calibrates response length to perceived complexity. `outputStyle: \"concise\"` in settings.json cuts that — one line, claimed 40-65% output reduction on chatty workloads.",
+    "mcp_overflow_no_tool_search": "Anthropic measured 191,300 -> 122,800 token context recovery with `ENABLE_TOOL_SEARCH=auto`. Tools still callable; definitions load lazily instead of dumping into the system prompt.",
+    "high_context_per_turn": "Sonnet 4.5 accuracy degrades past 256K and collapses to ~18% past 500K. Bigger context isn't free — Claude can't fully use it past those thresholds.",
 }
 
 
@@ -799,7 +805,7 @@ def _render_terminal(result: dict) -> None:
 
 
 def _print_next_steps(c: "_C", findings: list) -> None:
-    print(f"  {c.GRAY}─" * 36 + f"{c.RESET}")
+    print(f"  {c.GRAY}{'─' * 72}{c.RESET}")
     print(f"  next steps:")
     if findings:
         print(f"    {c.BOLD}tokenmin show <id>{c.RESET}    drill into one finding")

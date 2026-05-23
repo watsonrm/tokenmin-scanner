@@ -80,6 +80,14 @@ class ConfigSnapshot:
     projects_total: int = 0
     projects_with_local_settings: int = 0
     projects_with_local_agents: int = 0
+    # Output-style configuration. v0.5: surface absence of `outputStyle` so the
+    # engine can recommend the one-line config change Anthropic measures at
+    # 40–65% output-token reduction.
+    output_style: str | None = None
+    # Tool-search runtime env. v0.5: when many MCP servers are connected,
+    # ENABLE_TOOL_SEARCH=auto recovers ~70K context tokens (Anthropic measured
+    # 191,300 → 122,800). Surface its presence so the detector can recommend.
+    enable_tool_search: str | None = None
 
 
 @dataclass
@@ -291,6 +299,16 @@ def scan_config(claude_home: Path) -> ConfigSnapshot:
                     v = perms.get(k) or []
                     if isinstance(v, list):
                         snap.permission_count += len(v)
+            # v0.5: output-style + tool-search runtime env, both surfaced for
+            # the detection layer.
+            out_style = data.get("outputStyle")
+            if isinstance(out_style, str) and out_style.strip():
+                snap.output_style = out_style.strip()
+            env = data.get("env") or {}
+            if isinstance(env, dict):
+                v = env.get("ENABLE_TOOL_SEARCH")
+                if isinstance(v, str) and v.strip():
+                    snap.enable_tool_search = v.strip()
 
     claude_md = claude_home / "CLAUDE.md"
     if claude_md.exists():
