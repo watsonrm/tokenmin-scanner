@@ -1,41 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native parser for Claude Desktop's local Electron store.
 
-NOT YET IMPLEMENTED. Claude Desktop stores conversations in an Electron-managed
-LevelDB / IndexedDB under (macOS) `~/Library/Application Support/Claude/`. The
-format is not publicly documented and decoding it cleanly takes more than the
-F&F preview budget.
+NOT YET IMPLEMENTED for live parsing. Claude Desktop stores conversations in an
+Electron-managed LevelDB / IndexedDB under (macOS) `~/Library/Application
+Support/Claude/`. Decoding it cleanly takes more than the F&F preview budget.
 
-Today, the path that works for Desktop users is:
-  Settings -> Export data -> chat export zip
-  tokenmin --source export --from path/to/export.zip --out report.md
+This module still does useful work today: it reports the store path it WOULD
+parse, plus precise platform-specific export instructions so Desktop users have
+a single clear next step.
 
-That uses analyzer_chat_export.py, which Anthropic ships the same export
-format for both claude.ai and Claude Desktop.
-
-When this stub becomes a real adapter, it should produce a Snapshot with the
-same schema, populated from the live local store (no manual export step).
+When the live parser lands, replace `collect_from_desktop_native` here with the
+real implementation that produces the same `Snapshot` schema. The CLI wiring
+in `tokenmin.py` already routes `--source desktop-native` here.
 """
 from __future__ import annotations
 
-from pathlib import Path
+import platform
 import sys
+from pathlib import Path
 
 from analyzer import Snapshot
 
 
-# Hints for the eventual implementation — keep these around so the next
-# session has a starting trail.
-DESKTOP_STORE_HINTS = {
-    "darwin": "~/Library/Application Support/Claude/",
-    "win32": "%APPDATA%/Claude/",
-    "linux": "~/.config/Claude/",
+_DESKTOP_STORE_HINTS = {
+    "Darwin":  Path.home() / "Library" / "Application Support" / "Claude",
+    "Linux":   Path.home() / ".config" / "Claude",
 }
 
 
-def collect_from_desktop_native(claude_desktop_home: Path | None, days: int = 30) -> Snapshot:
-    raise SystemExit(
-        "tokenmin: native Claude Desktop parsing is not implemented yet.\n"
-        "for Desktop users today: export your chats from Settings -> Export data,\n"
-        "then run: tokenmin --source export --from path/to/export.zip --out report.md\n"
-    )
+def _windows_store() -> Path | None:
+    """%APPDATA%\\Claude on Windows."""
+    import os
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Claude"
+    return None
+
+
+def desktop_store_path() -> Path | None:
+    """The Electron store path Claude Desktop uses on this platform, if known."""
+    system = platform.system()
+    if system == "Windows":
+        return _windows_store()
+    return _DESKTOP_STORE_HINTS.get(system)
+
+
+def collect_from_desktop_native(_unused: Path | None, days: int = 30) -> Snapshot:
+    """Print precise next-step instructions, then exit non-zero.
+
+    Rather than a generic 'not implemented' message, tell the user the literal
+    path the store lives at on THEIR platform plus the exact menu path to
+    trigger an export. Reduces 'what do I do' friction.
+    """
+    store = desktop_store_path()
+    msg = ["tokenmin: native Claude Desktop parsing is not implemented yet."]
+    if store is not None:
+        if store.exists():
+            msg.append(f"  detected Desktop store at: {store}")
+            msg.append("  (the live parser will read this directly in a future release.)")
+        else:
+            msg.append(f"  no Desktop store found at: {store}")
+            msg.append("  is Claude Desktop installed? https://claude.ai/download")
+    else:
+        msg.append(f"  unknown platform '{platform.system()}'.")
+
+    msg += [
+        "",
+        "Workflow today (works for both Desktop and claude.ai):",
+        "  1. Open Claude Desktop (or claude.ai in a browser).",
+        "  2. Settings -> Privacy / Account -> Export data.",
+        "  3. Wait for the export email, download the .zip.",
+        "  4. tokenmin --source export --from path/to/claude-export-*.zip --out report.md",
+    ]
+    raise SystemExit("\n".join(msg))

@@ -318,6 +318,7 @@ def _doctor() -> int:
     else:
         line("audit log", f"{audit} (not yet created — runs once)")
 
+    # Multi-Claude detection.
     claude = Path.home() / ".claude"
     if claude.exists():
         sess_dir = claude / "projects"
@@ -326,9 +327,26 @@ def _doctor() -> int:
             for p in sess_dir.iterdir():
                 if p.is_dir():
                     n_sess += sum(1 for _ in p.glob("*.jsonl"))
-        line("~/.claude", f"present ({n_sess} session files)", n_sess > 0)
+        line("Claude Code", f"~/.claude ({n_sess} session files)", n_sess > 0)
     else:
-        line("~/.claude", "MISSING — install Claude Code or use --source export", False)
+        line("Claude Code", "not detected (~/.claude missing)", False)
+
+    # Desktop store — platform-specific path
+    if platform.system() == "Darwin":
+        desktop_dir = Path.home() / "Library" / "Application Support" / "Claude"
+    elif platform.system() == "Linux":
+        desktop_dir = Path.home() / ".config" / "Claude"
+    elif platform.system() == "Windows":
+        desktop_dir = Path(os.environ.get("APPDATA", "")) / "Claude"
+    else:
+        desktop_dir = None
+
+    if desktop_dir and desktop_dir.exists():
+        line("Claude Desktop", str(desktop_dir))
+    elif desktop_dir:
+        line("Claude Desktop", f"not detected ({desktop_dir})")
+    else:
+        line("Claude Desktop", "not supported on this platform")
 
     # Engine availability
     engine_dir = root / "engine"
@@ -369,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         return _uninstall(argv[1:])
     if argv and argv[0] in ("version", "--version", "-V"):
         return _print_version()
+    if argv and argv[0] == "selftest":
+        return _selftest()
 
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -580,6 +600,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(msg, file=sys.stderr)
     return 0
+
+
+def _selftest() -> int:
+    """Run the bundled property + CLI tests against the installed tree.
+
+    Same suite CI runs on every push. Catches "is your install actually
+    intact?" — useful after manual edits, partial pulls, or filesystem
+    corruption.
+    """
+    import subprocess
+    root = _install_dir()
+    runner = root / "tests" / "run.sh"
+    if not runner.exists():
+        print(
+            f"tokenmin selftest: tests not present at {runner}.\n"
+            "(scanner builds without tests are unusual — re-run the installer.)",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"tokenmin selftest: running {runner}")
+    res = subprocess.run(["bash", str(runner)], cwd=str(root))
+    return res.returncode
 
 
 def _uninstall(args: list[str]) -> int:
