@@ -229,10 +229,157 @@ def _payload_digest(payload: dict) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _install_dir() -> Path:
+    """Find the tokenmin install root (the bundle / scanner repo checkout)."""
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _version_info() -> dict:
+    """Read version metadata from git + VERSION file if present."""
+    root = _install_dir()
+    info: dict[str, str] = {}
+    vfile = root / "VERSION"
+    if vfile.exists():
+        info["version"] = vfile.read_text(encoding="utf-8").strip()
+    try:
+        import subprocess
+        sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=2,
+        ).stdout.strip()
+        if sha:
+            info["commit"] = sha[:12]
+        date = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%cI"],
+            capture_output=True, text=True, check=False, timeout=2,
+        ).stdout.strip()
+        if date:
+            info["commit_date"] = date
+        remote = subprocess.run(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=False, timeout=2,
+        ).stdout.strip()
+        if remote:
+            info["remote"] = remote
+    except Exception:
+        pass
+    return info
+
+
+def _print_version() -> int:
+    info = _version_info()
+    if "version" in info:
+        print(f"tokenmin {info['version']}")
+    else:
+        print(f"tokenmin (development build)")
+    if "commit" in info:
+        print(f"  commit:  {info['commit']}")
+    if "commit_date" in info:
+        print(f"  date:    {info['commit_date']}")
+    if "remote" in info:
+        print(f"  remote:  {info['remote']}")
+    print(f"  install: {_install_dir()}")
+    print(f"  python:  {sys.version.split()[0]}")
+    return 0
+
+
+def _doctor() -> int:
+    """Self-diagnostic. Prints status of every component the installer touched."""
+    import platform
+    root = _install_dir()
+    ok = True
+
+    def line(label, value, good=True):
+        nonlocal ok
+        if not good:
+            ok = False
+        marker = "\033[32m✓\033[0m" if good else "\033[31m✗\033[0m"
+        print(f"  {marker} {label:<32} {value}")
+
+    print("tokenmin doctor — checking your install")
+    print()
+
+    line("python", sys.version.split()[0], sys.version_info >= (3, 10))
+    line("platform", f"{platform.system()} {platform.release()}")
+    line("install dir", str(root), root.exists())
+
+    salt_path = Path.home() / ".tokenmin" / ".salt"
+    salt_env = os.environ.get("TOKENMIN_SALT_PATH")
+    if salt_env:
+        salt_path = Path(salt_env).expanduser()
+    salt_ok = salt_path.exists() and salt_path.stat().st_size >= 32
+    mode = oct(salt_path.stat().st_mode & 0o777) if salt_path.exists() else "absent"
+    line("salt file", f"{salt_path} ({mode})", salt_ok and (mode == "0o600" or not salt_path.exists() or salt_path.parent != Path.home() / ".tokenmin"))
+
+    audit = Path.home() / ".tokenmin" / "audit.log"
+    if audit.exists():
+        size = audit.stat().st_size
+        line("audit log", f"{audit} ({size} bytes)")
+    else:
+        line("audit log", f"{audit} (not yet created — runs once)")
+
+    claude = Path.home() / ".claude"
+    if claude.exists():
+        sess_dir = claude / "projects"
+        n_sess = 0
+        if sess_dir.is_dir():
+            for p in sess_dir.iterdir():
+                if p.is_dir():
+                    n_sess += sum(1 for _ in p.glob("*.jsonl"))
+        line("~/.claude", f"present ({n_sess} session files)", n_sess > 0)
+    else:
+        line("~/.claude", "MISSING — install Claude Code or use --source export", False)
+
+    # Engine availability
+    engine_dir = root / "engine"
+    engine_module = engine_dir / "tokenmin_engine.py"
+    if engine_module.exists():
+        line("engine", f"{engine_module.name} (F&F bundle)")
+    else:
+        line("engine", "not bundled (public scanner only — no reports without --submit-url)", True)
+
+    # Auto-update setting
+    au_mode = os.environ.get("TOKENMIN_AUTOUPDATE", "prompt")
+    line("auto-update", f"{au_mode} (env: TOKENMIN_AUTOUPDATE)")
+
+    # PATH check (best-effort — only reliable when invoked via the wrapper)
+    bin_link = Path.home() / ".local" / "bin" / "tokenmin"
+    if bin_link.exists():
+        target = bin_link.resolve() if bin_link.is_symlink() else None
+        line("symlink", f"{bin_link} -> {target}", target == (root / "tokenmin").resolve())
+    else:
+        line("symlink", f"{bin_link} (not found; you may be running tokenmin directly)")
+
+    print()
+    if ok:
+        print("doctor: everything looks healthy.")
+        return 0
+    else:
+        print("doctor: issues found above. fix them or rerun the installer.")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Subcommands ('doctor', 'uninstall') come before the main argparser so they
+    # have access to special-case behavior. Keep this loop simple.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "doctor":
+        return _doctor()
+    if argv and argv[0] == "uninstall":
+        return _uninstall(argv[1:])
+    if argv and argv[0] in ("version", "--version", "-V"):
+        return _print_version()
+
     p = argparse.ArgumentParser(
         prog="tokenmin",
-        description="Claude Improvement Plan — open client: collect, anonymize, submit.",
+        description="Claude Improvement Plan — open client: collect, anonymize, submit.\n\n"
+                    "Subcommands: doctor (self-diagnose), uninstall, version",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--version", "-V",
+        action="store_true",
+        help="Print version information and exit",
     )
     p.add_argument(
         "--source",
@@ -307,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Dump a deterministic anonymization of sample inputs and exit. Use this to inspect the scrubber rules without reading code.",
     )
     args = p.parse_args(argv)
+
+    if args.version:
+        return _print_version()
 
     if args.selfcheck:
         print(json.dumps(selfcheck(), indent=2))
@@ -429,6 +579,72 @@ def main(argv: list[str] | None = None) -> int:
         "The open client holds no detection rules — see LICENSING.md.\n"
     )
     print(msg, file=sys.stderr)
+    return 0
+
+
+def _uninstall(args: list[str]) -> int:
+    """Remove the install dir + symlink. Prompts before deleting state."""
+    import argparse as _ap
+    sp = _ap.ArgumentParser(prog="tokenmin uninstall", description="Remove tokenmin from this machine.")
+    sp.add_argument("--keep-state", action="store_true", help="Keep ~/.tokenmin/.salt and audit.log (default removes them)")
+    sp.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    a = sp.parse_args(args)
+
+    root = _install_dir()
+    bin_link = Path.home() / ".local" / "bin" / "tokenmin"
+    state_dir = Path.home() / ".tokenmin"
+
+    print("tokenmin uninstall will remove:")
+    print(f"  install dir:  {root}")
+    if bin_link.is_symlink():
+        print(f"  symlink:      {bin_link}")
+    if not a.keep_state and state_dir.exists() and state_dir != root:
+        print(f"  state dir:    {state_dir}  (salt, audit log)")
+    if state_dir == root:
+        print(f"  (state lives inside install dir; --keep-state has no effect)")
+
+    if not a.yes:
+        if not sys.stdin.isatty():
+            print("tokenmin uninstall: refusing non-interactive run without --yes", file=sys.stderr)
+            return 2
+        ans = input("proceed? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("aborted.")
+            return 1
+
+    import shutil
+    # Remove symlink if it points at us.
+    if bin_link.is_symlink():
+        try:
+            target = bin_link.resolve()
+            if target == (root / "tokenmin").resolve():
+                bin_link.unlink()
+                print(f"removed symlink: {bin_link}")
+            else:
+                print(f"left {bin_link} alone (points at {target}, not us)")
+        except OSError as exc:
+            print(f"warning: could not remove {bin_link}: {exc}", file=sys.stderr)
+
+    # Remove install dir.
+    if root.exists():
+        try:
+            shutil.rmtree(root)
+            print(f"removed install dir: {root}")
+        except OSError as exc:
+            print(f"error: could not remove {root}: {exc}", file=sys.stderr)
+            return 3
+
+    # State dir cleanup (only if separate from install dir).
+    if not a.keep_state and state_dir.exists() and state_dir != root:
+        try:
+            shutil.rmtree(state_dir)
+            print(f"removed state dir:   {state_dir}")
+        except OSError as exc:
+            print(f"warning: could not remove {state_dir}: {exc}", file=sys.stderr)
+
+    print()
+    print("uninstalled. you may also want to remove the PATH line the installer added")
+    print("to your shell rc (~/.zshrc / ~/.bashrc / ~/.config/fish/config.fish).")
     return 0
 
 
