@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scrubber-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Confirm scanner files are bit-identical to public watsonrm/tokenmin-scanner
+        # Only run for the F&F bundle repo (which mirrors the public scanner).
+        # On the public scanner itself this is a no-op (it IS the canonical copy).
+        if: github.repository == 'watsonrm/tokenmin'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/watsonrm/tokenmin-scanner.git /tmp/tms-pub
+          if diff -r --exclude=__pycache__ --exclude=.last-update-check \
+                  --exclude=.salt --exclude=audit.log \
+                  skills/tokenmin/ /tmp/tms-pub/skills/tokenmin/; then
+            echo "✓ scanner files mirror watsonrm/tokenmin-scanner exactly"
+          else
+            echo "✗ scanner files have drifted from watsonrm/tokenmin-scanner"
+            echo "  re-sync before merging"
+            exit 1
+          fi
+
+      - name: Run scrubber + CLI tests
+        run: bash tests/run.sh
+
+      - name: Confirm anonymizer catches a real ~/.claude leak vector
+        # Build a synthetic ~/.claude with leaky paths and confirm none of
+        # the plaintext markers survive the scrubber.
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          export HOME="${tmp}"            # so the salt + audit log land in a sandbox
+          mkdir -p "${tmp}/.claude/projects/-Users-rick-Documents-Channable-Wiki"
+          cat > "${tmp}/.claude/projects/-Users-rick-Documents-Channable-Wiki/session.jsonl" <<'EOF'
+          {"type":"user","timestamp":"2026-05-23T10:00:00Z","message":{"role":"user","content":"check /Users/rick/Documents/Channable_Wiki/backlog.md"}}
+          {"type":"assistant","timestamp":"2026-05-23T10:00:01Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/Users/rick/Documents/Channable_Wiki/backlog.md"}}],"usage":{"input_tokens":100,"output_tokens":50}}}
+          EOF
+          echo "{}" > "${tmp}/.claude/settings.json"
+          # Run with the test salt so output is deterministic in CI logs.
+          export TOKENMIN_SALT_PATH="${PWD}/tests/fixtures/test.salt"
+          export TOKENMIN_AUTOUPDATE="off"
+          bash ./tokenmin --claude-home "${tmp}/.claude" --days 30 \
+               --snapshot "${tmp}/snap.json" --force 2>/dev/null || true
+          # The scanner exits non-zero when no engine is present; that's expected.
+          # What matters is the snapshot file is clean.
+          if grep -qE 'Channable|rick|/Users/[a-z]' "${tmp}/snap.json"; then
+            echo "✗ LEAK: plaintext identifying strings survived in snapshot"
+            grep -E 'Channable|rick|/Users/[a-z]' "${tmp}/snap.json" | head
+            exit 1
+          else
+            echo "✓ no plaintext leaks in synthetic-input snapshot"
+          fi

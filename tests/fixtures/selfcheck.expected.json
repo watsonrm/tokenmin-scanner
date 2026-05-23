@@ -1,0 +1,53 @@
+{
+  "examples": [
+    {
+      "input": "API: sk-ant-abc123def456ghi789jkl0123",
+      "output": "API: <ANTHROPIC_KEY>"
+    },
+    {
+      "input": "email: rick@rmwcommerce.com, ip 10.0.0.1",
+      "output": "email: <EMAIL>, ip <IP>"
+    },
+    {
+      "input": "path /Users/richardmwatson/Documents/Channable_Wiki/backlog.md",
+      "output": "path <path:6c188de75c93d864>"
+    },
+    {
+      "input": "url-encoded %2FUsers%2Frickwatson%2F",
+      "output": "url-encoded %2FUsers%2F<USER>%2F"
+    },
+    {
+      "input": "mangled -Users-richardmwatson-Documents-Channable-Wiki",
+      "output": "mangled <path:b84ad907deadfdb6>"
+    },
+    {
+      "input": "Bearer\n  xoxb-123456789012-abcdefghij",
+      "output": "Bearer\n  <SLACK_TOKEN>"
+    },
+    {
+      "input": "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signaturePartHere1234",
+      "output": "JWT <JWT>"
+    },
+    {
+      "input": "stripe sk_live_abcdefghij1234567890XYZ",
+      "output": "stripe <STRIPE_KEY>"
+    },
+    {
+      "input": "high entropy: AbcDef123456789012XyzGhi3456789012",
+      "output": "high entropy: <HIGH_ENTROPY_TOKEN>"
+    }
+  ],
+  "labels": {
+    "project": "<id:a8416fc4862b7210>",
+    "mcp_servers": [
+      "<id:26b39eda9d15cecc>",
+      "<id:4583b454fc84d284>",
+      "<id:8f56790ecdd83088>"
+    ],
+    "custom_skills": [
+      "<id:acc914ce465df285>",
+      "<id:4b9547260bf7f773>"
+    ]
+  },
+  "strict_mode": false
+}

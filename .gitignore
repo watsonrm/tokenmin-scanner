@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .last-update-check
-# Per-install secrets and audit trails — never commit.
-.salt
-audit.log
+# Per-install secrets and audit trails — never commit (root-only patterns so
+# test fixtures like tests/fixtures/test.salt aren't blocked).
+/.salt
+/audit.log
