@@ -411,6 +411,8 @@ def main(argv: list[str] | None = None) -> int:
             print("usage: tokenmin show <finding-id>", file=sys.stderr)
             return 2
         return _render_show(argv[1])
+    if argv and argv[0] == "watch":
+        return _watch(argv[1:])
 
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -872,6 +874,10 @@ def _render_help() -> int:
     print(f"  {c.BOLD}Drill into one finding{c.RESET}")
     print(f"    {c.CYAN}tokenmin show <id>{c.RESET}            full evidence + the fix")
     print()
+    print(f"  {c.BOLD}Live dashboard{c.RESET}")
+    print(f"    {c.CYAN}tokenmin watch{c.RESET}                real-time spend + cache hit + sparkline (Ctrl-C to exit)")
+    print(f"    {c.CYAN}tokenmin watch --alert 5{c.RESET}      beep when active session crosses $5")
+    print()
     print(f"  {c.BOLD}Variants{c.RESET}")
     print(f"    {c.CYAN}tokenmin --source export --from FILE{c.RESET}    audit claude.ai or Desktop export")
     print(f"    {c.CYAN}tokenmin --out report.md{c.RESET}                write full markdown report")
@@ -965,6 +971,313 @@ def _auto_days(claude_home: Path, requested: str | int) -> int:
     if n > 50:
         return 14
     return 30
+
+
+# --- tokenmin watch (live dashboard) ---------------------------------------
+
+# Pricing per million tokens, by model family. (input, output, cache_write, cache_read)
+_WATCH_PRICING = {
+    "opus":   (15.00, 75.00, 18.75, 1.50),
+    "sonnet": ( 3.00, 15.00,  3.75, 0.30),
+    "haiku":  ( 0.80,  4.00,  1.00, 0.08),
+}
+
+
+def _watch_price(model: str | None) -> tuple[float, float, float, float]:
+    if not model:
+        return _WATCH_PRICING["sonnet"]
+    m = model.lower()
+    for key, prices in _WATCH_PRICING.items():
+        if key in m:
+            return prices
+    return _WATCH_PRICING["sonnet"]
+
+
+def _active_sessions(claude_home: Path, max_age_sec: float) -> list[Path]:
+    """Return jsonl session files modified within max_age_sec, newest first."""
+    proj_dir = claude_home / "projects"
+    if not proj_dir.is_dir():
+        return []
+    now = time.time()
+    found: list[tuple[float, Path]] = []
+    for p in proj_dir.rglob("*.jsonl"):
+        try:
+            mt = p.stat().st_mtime
+            if now - mt <= max_age_sec:
+                found.append((mt, p))
+        except OSError:
+            continue
+    found.sort(reverse=True)
+    return [p for _, p in found]
+
+
+def _parse_session_live(path: Path) -> dict:
+    """Cheap parse of one jsonl session. Returns aggregated metrics for the dashboard.
+
+    Defensive about schema (same as analyzer.py). Stops on first read error
+    rather than raising — the file might be mid-write."""
+    from collections import Counter as _Counter
+    stats = {
+        "session_id": path.stem,
+        "project": path.parent.name,
+        "started_at": None,
+        "last_at": None,
+        "user_turns": 0,
+        "assistant_turns": 0,
+        "tool_calls": _Counter(),
+        "models": _Counter(),
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "est_cost_usd": 0.0,
+        "size_bytes": 0,
+    }
+    try:
+        stats["size_bytes"] = path.stat().st_size
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = event.get("timestamp")
+                if isinstance(ts, str):
+                    try:
+                        t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                        if stats["started_at"] is None:
+                            stats["started_at"] = t
+                        stats["last_at"] = t
+                    except ValueError:
+                        pass
+                role = event.get("type") or event.get("role")
+                inner = event.get("message") or {}
+                role = role or inner.get("role")
+                if role == "user":
+                    stats["user_turns"] += 1
+                elif role == "assistant":
+                    stats["assistant_turns"] += 1
+                    usage = event.get("usage") or inner.get("usage") or {}
+                    model = event.get("model") or inner.get("model")
+                    it = int(usage.get("input_tokens", 0) or 0)
+                    ot = int(usage.get("output_tokens", 0) or 0)
+                    cw = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                    cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+                    stats["input_tokens"] += it
+                    stats["output_tokens"] += ot
+                    stats["cache_write_tokens"] += cw
+                    stats["cache_read_tokens"] += cr
+                    if model:
+                        stats["models"][model] += 1
+                        pi, po, pcw, pcr = _watch_price(model)
+                        stats["est_cost_usd"] += (it * pi + ot * po + cw * pcw + cr * pcr) / 1_000_000
+                    # walk content for tool_use
+                    content = inner.get("content") or event.get("content") or []
+                    if isinstance(content, list):
+                        for b in content:
+                            if isinstance(b, dict) and b.get("type") == "tool_use":
+                                stats["tool_calls"][b.get("name", "?")] += 1
+    except OSError:
+        pass
+    return stats
+
+
+def _fmt_tok(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.0f}K"
+    return str(n)
+
+
+def _fmt_duration(start: float | None, end: float | None) -> str:
+    if not start or not end:
+        return "—"
+    s = max(0, int(end - start))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s//60}m{s%60}s"
+    return f"{s//3600}h{(s%3600)//60}m"
+
+
+_SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float]) -> str:
+    if not values:
+        return ""
+    vmax = max(values) or 1.0
+    out = []
+    for v in values:
+        if v <= 0:
+            out.append("·")
+        else:
+            idx = min(len(_SPARKLINE_CHARS) - 1, int((v / vmax) * (len(_SPARKLINE_CHARS) - 1)))
+            out.append(_SPARKLINE_CHARS[idx])
+    return "".join(out)
+
+
+def _watch(args: list[str]) -> int:
+    """Live dashboard. Polls ~/.claude every poll_interval seconds and refreshes."""
+    import argparse as _ap
+    from collections import deque
+    sp = _ap.ArgumentParser(prog="tokenmin watch", description="Live token-spend dashboard.")
+    sp.add_argument("--claude-home", default=str(Path.home() / ".claude"))
+    sp.add_argument("--interval", type=float, default=2.0, help="Poll interval in seconds (default 2)")
+    sp.add_argument(
+        "--max-idle-min",
+        type=float,
+        default=15.0,
+        help="Sessions idle > this many minutes drop off the dashboard (default 15)",
+    )
+    sp.add_argument(
+        "--alert",
+        type=float,
+        default=None,
+        help="Beep when active session cost crosses this $ threshold",
+    )
+    a = sp.parse_args(args)
+
+    home = Path(a.claude_home).expanduser()
+    if not home.exists():
+        print(f"tokenmin watch: {home} does not exist.", file=sys.stderr)
+        return 2
+
+    c = _C(_ansi_supported())
+    # Disable line-buffering on stdout so the redraws don't flicker awkwardly.
+    sys.stdout.reconfigure(line_buffering=False) if hasattr(sys.stdout, "reconfigure") else None
+
+    last_run = _load_last_run() or {}
+    top_findings = (last_run.get("findings") or [])[:3]
+
+    # Sparkline history: (input+output) tokens per poll, kept as a 30-wide deque
+    history: deque[float] = deque(maxlen=30)
+    prev_total = 0.0
+    alerted = False
+
+    # Hide cursor + ensure we restore on exit.
+    print("\033[?25l", end="", flush=True)
+    try:
+        while True:
+            sessions = _active_sessions(home, a.max_idle_min * 60)
+            now = time.time()
+
+            # Clear screen + home cursor.
+            print("\033[2J\033[H", end="")
+
+            # Header.
+            print(f"{c.BOLD}{c.MAGENTA}Tokenmin watch{c.RESET}  {c.GRAY}refresh {a.interval:.0f}s · Ctrl-C to exit{c.RESET}")
+            print(f"{c.GRAY}{'─'*72}{c.RESET}")
+
+            if not sessions:
+                print()
+                print(f"  {c.DIM}no active Claude Code session in the last {int(a.max_idle_min)} min{c.RESET}")
+                print(f"  {c.DIM}start a Claude Code session and this dashboard will populate{c.RESET}")
+            else:
+                active = _parse_session_live(sessions[0])
+                others = len(sessions) - 1
+
+                # Track delta + sparkline
+                current_total = active["input_tokens"] + active["output_tokens"]
+                delta = max(0.0, current_total - prev_total)
+                history.append(delta)
+                prev_total = current_total
+
+                # Alert
+                if a.alert is not None and not alerted and active["est_cost_usd"] >= a.alert:
+                    print("\007", end="", flush=True)
+                    alerted = True
+
+                # Session card.
+                started_iso = (
+                    datetime.fromtimestamp(active["started_at"], tz=timezone.utc).strftime("%H:%M UTC")
+                    if active["started_at"] else "—"
+                )
+                last_iso = (
+                    datetime.fromtimestamp(active["last_at"], tz=timezone.utc).strftime("%H:%M:%S UTC")
+                    if active["last_at"] else "—"
+                )
+                duration = _fmt_duration(active["started_at"], active["last_at"])
+
+                print()
+                print(f"  {c.BOLD}Active session{c.RESET}  {c.DIM}{active['project'][:50]}{c.RESET}")
+                print(f"    started   {started_iso}    duration {duration}    last activity {last_iso}")
+                print()
+
+                # Token + cost table
+                in_tok = active["input_tokens"]
+                out_tok = active["output_tokens"]
+                cr = active["cache_read_tokens"]
+                cw = active["cache_write_tokens"]
+                cost = active["est_cost_usd"]
+
+                cache_total = cr + cw + in_tok
+                cache_hit = (cr / cache_total) if cache_total > 0 else 0
+                cache_bar = _bar(cache_hit, width=20)
+
+                print(f"  {c.BOLD}Spend this session{c.RESET}  {c.BOLD}{_fmt_money(cost)}{c.RESET}")
+                print(f"    input {c.BOLD}{_fmt_tok(in_tok)}{c.RESET}   output {c.BOLD}{_fmt_tok(out_tok)}{c.RESET}   cache-read {c.BOLD}{_fmt_tok(cr)}{c.RESET}   cache-write {c.BOLD}{_fmt_tok(cw)}{c.RESET}")
+                cache_color = c.GREEN if cache_hit >= 0.5 else c.YELLOW if cache_hit >= 0.2 else c.RED
+                print(f"    cache hit  {cache_color}{cache_bar}{c.RESET}  {int(cache_hit*100)}%   {c.DIM}(Anthropic target >90% for repeated workloads){c.RESET}")
+                print()
+
+                # Models in session
+                if active["models"]:
+                    total_calls = sum(active["models"].values())
+                    model_line = "  ·  ".join(
+                        f"{m.split('-')[1].title() if '-' in m else m} {round(100*n/total_calls)}%"
+                        for m, n in active["models"].most_common(3)
+                    )
+                    print(f"  {c.BOLD}Models{c.RESET}        {model_line}")
+
+                # Tools
+                if active["tool_calls"]:
+                    total_t = sum(active["tool_calls"].values())
+                    tool_line = "  ·  ".join(
+                        f"{name} {round(100*n/total_t)}%"
+                        for name, n in active["tool_calls"].most_common(5)
+                    )
+                    print(f"  {c.BOLD}Tools{c.RESET}         {tool_line}")
+
+                print(f"  {c.BOLD}Turns{c.RESET}         user {active['user_turns']}  ·  assistant {active['assistant_turns']}")
+                print()
+
+                # Sparkline of recent token deltas
+                if history:
+                    spark = _sparkline(list(history))
+                    print(f"  {c.BOLD}Token rate{c.RESET}    {c.CYAN}{spark}{c.RESET}   {c.DIM}last {len(history)} polls{c.RESET}")
+                    print()
+
+                if others:
+                    print(f"  {c.DIM}+ {others} other session(s) active in the last {int(a.max_idle_min)} min{c.RESET}")
+                    print()
+
+            # Top findings overlay from last_run.json
+            if top_findings:
+                print(f"{c.GRAY}{'─'*72}{c.RESET}")
+                print(f"  {c.BOLD}Top findings from last `tokenmin` run{c.RESET}")
+                for i, f in enumerate(top_findings, 1):
+                    save = f["savings_usd_per_month"]
+                    pill, color_attr, _ = _severity(save)
+                    pill_color = getattr(c, color_attr)
+                    print(f"    {i}. {pill_color}{pill:<4}{c.RESET} {_fmt_money(save)}/mo  {f['title'][:60]}")
+                print()
+            else:
+                print(f"  {c.DIM}(run `tokenmin` once to populate top findings here){c.RESET}")
+                print()
+
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Restore cursor + give a clean prompt.
+        print("\033[?25h", end="", flush=True)
+        print()
+    return 0
 
 
 def _selftest() -> int:
