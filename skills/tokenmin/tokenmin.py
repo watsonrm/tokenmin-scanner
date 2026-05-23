@@ -689,9 +689,13 @@ def main(argv: list[str] | None = None) -> int:
         if _telemetry_enabled():
             try:
                 snap_info = result.get("snapshot") or {}
+                # Use raw integer counts, not shares (issue scanner#1):
+                # shares are floats in [0,1] that would int-floor to 0 for
+                # anything <100%. Counts are more analytically useful for
+                # the discovery layer anyway.
                 families = {}
                 for m in snap_info.get("models") or []:
-                    families[m["name"].lower()] = m.get("share", 0)
+                    families[m["name"].lower()] = int(m.get("count", 0))
                 # Compute avg_tools_per_turn from the snapshot if not surfaced.
                 snapshot_summary = dict(snap_info)
                 # Best-effort avg-tools-per-turn from the raw snapshot dict.
