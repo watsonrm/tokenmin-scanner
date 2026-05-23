@@ -79,16 +79,12 @@ def _local_engine():
     return getattr(tokenmin_engine, "analyze", None)
 
 
-def _submit(url: str, api_key: str | None, snapshot: dict) -> str:
-    """POST the anonymized snapshot to the hosted engine; return the report.
-
-    HTTPS only — refuses http:// to prevent plaintext snapshot transmission.
-    localhost / 127.0.0.1 over http is allowed for testing against the local
-    server stub during F&F preview.
+def _check_submit_url(url: str) -> None:
+    """Refuse plaintext submission. Called early so the precondition fails fast
+    before any data is collected. HTTPS-only except for localhost/127.0.0.1
+    over http for local server-stub testing.
     """
     import urllib.parse
-    import urllib.request
-
     parsed = urllib.parse.urlparse(url)
     is_local = parsed.hostname in ("localhost", "127.0.0.1", "::1")
     if parsed.scheme != "https" and not (parsed.scheme == "http" and is_local):
@@ -97,6 +93,12 @@ def _submit(url: str, api_key: str | None, snapshot: dict) -> str:
             "(http:// is allowed only for localhost/127.0.0.1 during local testing.)"
         )
 
+
+def _submit(url: str, api_key: str | None, snapshot: dict) -> str:
+    """POST the anonymized snapshot to the hosted engine; return the report."""
+    import urllib.request
+
+    _check_submit_url(url)  # belt + suspenders; main() also calls this up front.
     payload = json.dumps({"snapshot": snapshot}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -343,6 +345,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 3
+
+    # Validate --submit-url BEFORE collecting any data, so an invalid scheme
+    # fails fast and never touches the filesystem.
+    if args.submit_url:
+        _check_submit_url(args.submit_url)
 
     if args.source == "code":
         home = Path(args.claude_home).expanduser()
