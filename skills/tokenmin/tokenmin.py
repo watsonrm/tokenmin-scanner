@@ -684,17 +684,25 @@ def main(argv: list[str] | None = None) -> int:
             _render_terminal(result)
 
         # Telemetry: send the event if enabled. Silent on every failure mode.
+        # The discovery fields (metrics + setup_signature) feed empirical
+        # detection of NEW optimization patterns — see SECURITY.md.
         if _telemetry_enabled():
             try:
                 snap_info = result.get("snapshot") or {}
                 families = {}
                 for m in snap_info.get("models") or []:
                     families[m["name"].lower()] = m.get("share", 0)
+                # Compute avg_tools_per_turn from the snapshot if not surfaced.
+                snapshot_summary = dict(snap_info)
+                # Best-effort avg-tools-per-turn from the raw snapshot dict.
+                snapshot_summary.setdefault("avg_tools_per_turn", None)
                 event = _build_telemetry_event(
                     subcommand="run",
                     findings_fired=[f["id"] for f in (result.get("findings") or [])],
                     session_count=snap_info.get("sessions", 0),
                     models_used_families=families,
+                    snapshot_summary=snapshot_summary,
+                    config_summary=snap_info.get("config") or {},
                 )
                 _send_telemetry(event)
             except Exception:
@@ -1716,6 +1724,14 @@ def _telemetry_endpoint() -> str | None:
     return s.get("telemetry_endpoint")
 
 
+def _bucket(value: float, edges: list[tuple[float, str]]) -> str:
+    """Return the first bucket label whose upper edge `value` falls under."""
+    for upper, label in edges:
+        if value < upper:
+            return label
+    return edges[-1][1]
+
+
 def _build_telemetry_event(
     *,
     subcommand: str,
@@ -1723,7 +1739,20 @@ def _build_telemetry_event(
     session_count: int | None = None,
     models_used_families: dict | None = None,
     error: tuple[str, str] | None = None,
+    snapshot_summary: dict | None = None,
+    config_summary: dict | None = None,
 ) -> dict:
+    """Telemetry payload — fixed shape, bucketed values only.
+
+    Purpose split across two design goals:
+      1. Rank existing detectors by population fire-rate (findings_fired).
+      2. Discover NEW detectors by observing distribution shape of metrics
+         that no current detector reads (metrics + setup_signature).
+
+    Privacy: everything numeric is bucketed so an attacker with the corpus
+    can't reverse a single install's exact values. Identifiers (install_id,
+    top_tool) are hash- or family-typed.
+    """
     import platform as _plat
     install_id = _telemetry_install_id()
     info = _version_info()
@@ -1739,19 +1768,104 @@ def _build_telemetry_event(
     if findings_fired is not None:
         event["findings_fired"] = sorted(findings_fired)
     if session_count is not None:
-        # Bucket so the exact number can't fingerprint usage intensity.
         if session_count == 0:      event["session_count_bucket"] = "0"
         elif session_count <= 10:    event["session_count_bucket"] = "1-10"
         elif session_count <= 100:   event["session_count_bucket"] = "11-100"
         else:                        event["session_count_bucket"] = "101+"
     if models_used_families is not None:
-        # Family only — Opus/Sonnet/Haiku/Other, no version IDs.
         event["models_used_families"] = {
             k: int(v) for k, v in models_used_families.items()
         }
+
+    # --- discovery fields ---------------------------------------------------
+    # Bucketed distribution shapes, NOT raw values. The goal is to make it
+    # possible to spot "there's a cluster at X% cache hit, lower than we'd
+    # predict — maybe a new detector lives there."
+    if snapshot_summary is not None:
+        s = snapshot_summary
+        metrics = {}
+
+        # Cache hit ratio bucket (whole distribution, not just <50% which is
+        # what detect_low_cache_hit_ratio looks at).
+        cr = s.get("cache_read_tokens") or 0
+        cw = s.get("cache_write_tokens") or 0
+        it = s.get("input_tokens") or 0
+        denom = cr + cw + it
+        if denom > 0:
+            ratio = cr / denom
+            metrics["cache_hit_bucket"] = _bucket(ratio, [
+                (0.20, "very-low"), (0.50, "low"), (0.80, "medium"),
+                (0.95, "high"),    (1.01, "very-high"),
+            ])
+
+        # Avg tools per assistant turn (parallelism signal).
+        atpt = s.get("avg_tools_per_turn")
+        if atpt is not None:
+            metrics["avg_tools_per_turn_bucket"] = _bucket(atpt, [
+                (1.5, "sequential"), (2.5, "mostly-sequential"),
+                (4.0, "moderate-parallel"), (8.0, "high-parallel"),
+                (1000.0, "extreme-parallel"),
+            ])
+
+        # Top tool by share (already anonymized — mcp__* names hash via
+        # _label_scrub_pass, others are public Claude Code tool names).
+        top_tools = s.get("top_tools") or []
+        if top_tools:
+            metrics["top_tool"] = top_tools[0].get("name")
+
+        # Cost-window bucket (USD/window) — distribution of spend intensity.
+        cost = s.get("total_cost_usd") or 0
+        if cost > 0:
+            metrics["window_cost_bucket"] = _bucket(cost, [
+                (1.0,   "trial"),     (50.0,    "light"),
+                (500.0, "moderate"),  (5000.0,  "heavy"),
+                (1e9,   "very-heavy"),
+            ])
+
+        # Per-turn input tokens average (context-pressure signal).
+        ut = s.get("user_turns") or 0
+        if ut > 0:
+            avg_in_per_turn = it / ut
+            metrics["avg_input_per_turn_bucket"] = _bucket(avg_in_per_turn, [
+                (1_000,    "minimal"),   (10_000,  "small"),
+                (50_000,   "moderate"),  (200_000, "large"),
+                (1e9,      "extreme"),
+            ])
+
+        if metrics:
+            event["metrics"] = metrics
+
+    if config_summary is not None:
+        # Setup signature — categorical features of the install's config.
+        # Each is bucketed; the combination clusters users into setup types
+        # without revealing identifiable specifics.
+        cfg = config_summary
+        sig = {}
+        sig["has_global_claude_md"] = bool(cfg.get("has_global_claude_md"))
+        cml = cfg.get("global_claude_md_lines") or 0
+        sig["claude_md_size_bucket"] = _bucket(cml, [
+            (1,    "absent"),  (100,  "small"),  (200,  "medium"),
+            (500,  "large"),   (10_000, "xlarge"),
+        ])
+        sig["hooks_bucket"] = _bucket(cfg.get("global_hook_count") or 0, [
+            (1, "none"), (3, "few"), (10, "some"), (10_000, "many"),
+        ])
+        sig["mcp_bucket"] = _bucket(cfg.get("mcp_servers") or 0, [
+            (1, "none"), (3, "few"), (10, "some"), (10_000, "many"),
+        ])
+        sig["custom_agents_bucket"] = _bucket(cfg.get("custom_agents") or 0, [
+            (1, "none"), (3, "few"), (10, "some"), (10_000, "many"),
+        ])
+        sig["custom_skills_bucket"] = _bucket(cfg.get("custom_skills") or 0, [
+            (1, "none"), (3, "few"), (10, "some"), (10_000, "many"),
+        ])
+        sig["output_style_set"] = bool(cfg.get("output_style"))
+        sig["enable_tool_search_set"] = bool(cfg.get("enable_tool_search"))
+        event["setup_signature"] = sig
+
     if error is not None:
         cls, loc = error
-        event["error"] = {"class": cls, "loc": loc}  # never the message itself
+        event["error"] = {"class": cls, "loc": loc}
     return event
 
 
@@ -1796,6 +1910,9 @@ def _maybe_telemetry_consent() -> None:
     print(f"    - which detectors fired (id only, never the values)", file=sys.stderr)
     print(f"    - session count bucketed (0 / 1-10 / 11-100 / 101+)", file=sys.stderr)
     print(f"    - model families used (Opus/Sonnet/Haiku — no version IDs)", file=sys.stderr)
+    print(f"    - distribution buckets (cache-hit / parallelism / cost / context pressure)", file=sys.stderr)
+    print(f"      so we can discover NEW optimization patterns we don't catch yet", file=sys.stderr)
+    print(f"    - your setup 'signature' (has CLAUDE.md / hook count / MCP count, bucketed)", file=sys.stderr)
     print(f"    - error class + source line on exceptions (no message, no paths)", file=sys.stderr)
     print(f"    - a stable install_id (HMAC of your salt — can't be reversed to identify you)", file=sys.stderr)
     print(file=sys.stderr)
@@ -1853,15 +1970,39 @@ def _telemetry_cmd(args: list[str]) -> int:
         print(f"  inspect what gets sent: {c.CYAN}tokenmin telemetry dry-run{c.RESET}")
         return 0
     if a.action == "dry-run":
-        # Build a representative event for the most common case (a tokenmin run).
+        # Representative event for a tokenmin run, including the discovery
+        # fields (metrics + setup_signature) the rule-base researcher uses
+        # to find candidate new detectors empirically.
         event = _build_telemetry_event(
             subcommand="run",
             findings_fired=["model_overspend", "no_output_style", "long_sessions_no_clear"],
             session_count=57,
             models_used_families={"opus": 52, "sonnet": 3},
+            snapshot_summary={
+                "sessions": 57,
+                "user_turns": 4100,
+                "input_tokens": 1_200_000,
+                "output_tokens": 15_000_000,
+                "cache_read_tokens": 80_000_000,
+                "cache_write_tokens": 2_000_000,
+                "avg_tools_per_turn": 1.4,
+                "total_cost_usd": 6860,
+                "top_tools": [{"name": "Bash", "share": 0.40}],
+            },
+            config_summary={
+                "has_global_claude_md": False,
+                "global_claude_md_lines": 0,
+                "global_hook_count": 0,
+                "mcp_servers": 1,
+                "custom_agents": 0,
+                "custom_skills": 0,
+                "output_style": None,
+                "enable_tool_search": None,
+            },
         )
         print("# This is the EXACT payload tokenmin would POST to the endpoint.")
         print("# Telemetry is only transmitted if `telemetry: on` AND an endpoint is configured.")
+        print("# Schema: tokenmin.telemetry.v1.")
         print(json.dumps(event, indent=2, sort_keys=True))
         return 0
     return 2

@@ -135,6 +135,8 @@ One event per `tokenmin` run, at the end. Schema `tokenmin.telemetry.v1`:
 | `session_count_bucket` | `"1-10"`, `"11-100"`, `"101+"` | corpus shape, bucketed so exact count can't fingerprint |
 | `models_used_families` | `{"opus": 52, "sonnet": 3}` | population model mix — family only, no version IDs |
 | `error` (only on exception) | `{"class": "OSError", "loc": "tokenmin.py:412"}` | crash signal — class name + source line, **never the message, never the path** |
+| `metrics` (discovery layer) | `{"cache_hit_bucket":"low","avg_tools_per_turn_bucket":"sequential","top_tool":"Bash","window_cost_bucket":"heavy","avg_input_per_turn_bucket":"large"}` | bucketed distribution shapes so we can discover NEW optimization patterns empirically (e.g., "30% of users in low-cache + high-input bucket — likely a new detector lives there") |
+| `setup_signature` (discovery layer) | `{"has_global_claude_md":false,"claude_md_size_bucket":"absent","hooks_bucket":"none","mcp_bucket":"few","custom_agents_bucket":"none","custom_skills_bucket":"none","output_style_set":false,"enable_tool_search_set":false}` | categorical features that cluster users into setup types without revealing identifiable specifics |
 
 ### What's never sent
 
