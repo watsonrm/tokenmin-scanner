@@ -1870,17 +1870,70 @@ def _build_telemetry_event(
 
 
 def _send_telemetry(event: dict) -> None:
-    """POST a telemetry event to the configured endpoint. Silent on every
-    failure mode — telemetry must never break a real run."""
+    """Transmit a telemetry event. Silent on every failure mode — telemetry
+    must never break a real run.
+
+    Two transport modes, picked by what's in settings.json:
+
+      1. `telemetry_endpoint` like `https://...`  — generic HTTPS POST. The
+         endpoint receives the event as a JSON body. Used when we eventually
+         deploy a Cloudflare Worker / Vercel function / Fly service.
+
+      2. `telemetry_endpoint` like `github://owner/repo` — GitHub Contents
+         API commit. `telemetry_github_token` carries the PAT (contents:write
+         on the target repo). Each event becomes a file at
+         `events/YYYY-MM-DD/<timestamp>-<install_id_prefix>.json` via a
+         single PUT call. This is the F&F-window setup.
+
+    Either way the JSON shape is identical, so migration between modes is
+    a single field change in settings.json.
+    """
+    import base64
+    import urllib.request
+    from urllib.parse import urlparse
+
     endpoint = _telemetry_endpoint()
     if not endpoint:
-        return  # no endpoint configured = no transmission
+        return
+
     try:
-        import urllib.request
-        from urllib.parse import urlparse
+        # github://owner/repo transport
+        if endpoint.startswith("github://"):
+            settings = _load_settings()
+            token = settings.get("telemetry_github_token")
+            if not token:
+                return
+            spec = endpoint[len("github://"):]
+            if "/" not in spec:
+                return
+            owner, repo = spec.split("/", 1)
+            now = datetime.now(timezone.utc)
+            day = now.strftime("%Y-%m-%d")
+            stamp = now.strftime("%Y-%m-%dT%H-%M-%S")
+            install_id = str(event.get("install_id", "unknown"))[:8]
+            filename = f"{stamp}-{install_id}.json"
+            path = f"events/{day}/{filename}"
+            body_json = json.dumps(event, indent=2, sort_keys=True)
+            url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+            payload = json.dumps({
+                "message": f"telemetry: {event.get('subcommand', 'run')}",
+                "content": base64.b64encode(body_json.encode("utf-8")).decode("ascii"),
+                "committer": {
+                    "name": "tokenmin-telemetry",
+                    "email": "telemetry@tokenmin.ai",
+                },
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, method="PUT")
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Accept", "application/vnd.github+json")
+            req.add_header("Content-Type", "application/json")
+            urllib.request.urlopen(req, timeout=3)
+            return
+
+        # Plain HTTPS endpoint
         scheme = urlparse(endpoint).scheme
         if scheme != "https":
-            return  # never send over plaintext
+            return
         payload = json.dumps(event).encode("utf-8")
         req = urllib.request.Request(endpoint, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
