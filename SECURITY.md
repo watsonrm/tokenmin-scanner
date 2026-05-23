@@ -1,0 +1,131 @@
+---
+title: "Tokenmin — Security Policy"
+status: active
+type: reference
+date: 2026-05-23
+---
+
+# Tokenmin — Security Policy
+
+## Reporting a vulnerability
+
+Email **security@rmwcommerce.com** with the subject line `[tokenmin]`. Include:
+
+- a description of the issue and where you found it (file path + line number where possible)
+- a proof-of-concept or reproduction steps
+- your assessment of impact
+- whether you'd like public credit
+
+Encrypt sensitive reports with PGP if you prefer — request the current key by writing to that address first.
+
+**Response targets:**
+- Acknowledgement within **2 business days** of receipt
+- Initial triage within **5 business days**
+- For confirmed high-severity issues: patch released within **14 days**, with the public scanner repo (`watsonrm/tokenmin-scanner`) tagged with a `SECURITY-FIX` release annotation
+
+We will not pursue legal action against good-faith researchers who:
+- avoid privacy violations and service disruption
+- give us a reasonable window to fix before public disclosure
+- don't access or exfiltrate user data beyond what's needed to demonstrate the issue
+
+## Supported versions
+
+During the friends-and-family preview, **the `main` branch of `watsonrm/tokenmin-scanner` is the only supported version.** All security fixes land there first.
+
+Auto-update default is interactive-prompt; users on `TOKENMIN_AUTOUPDATE=auto` get fixes within hours, users on prompt within a day, users on `off` only when they manually pull. If you operate Tokenmin at scale or in a security-sensitive environment, set `TOKENMIN_AUTOUPDATE=auto` *and* `TOKENMIN_REQUIRE_SIGNED=1`.
+
+## Threat model
+
+Tokenmin's threat model is **adversarial inputs + hostile network + curious but careful user**. We assume:
+
+- The user's machine is not pre-compromised — if it is, we cannot defend against it.
+- The user's Anthropic install (Claude Code, Desktop, claude.ai) is honest.
+- The user's network is *potentially* hostile (cafe wifi, corporate MITM proxy, compromised DNS).
+- The hosted endpoint, when one exists, is *moderately* trusted — we send it anonymized data but we don't trust it to be incorruptible.
+- The git remote (`origin`) is trusted to the extent that GitHub is trusted, plus our signing-key discipline.
+
+We **do not** defend against:
+- An attacker with code-execution on the user's machine.
+- A compromised Anthropic install feeding adversarial JSONL designed to confuse the analyzer.
+- The hosted engine intentionally exfiltrating submitted data — that's the bargain; if you don't trust the engine, don't submit.
+
+## What we do defend against
+
+### Input handling
+
+- **Adversarial session files.** A malicious `~/.claude/projects/*/*.jsonl` is parsed defensively: lines that don't parse are dropped; oversized strings are truncated before the scrubber sees them (`_MAX_SCRUB_LEN = 64 KiB`); the analyzer never raises on a bad line.
+- **Adversarial chat-export zips.** We don't extract; we read `conversations.json` from the zip directly. Files larger than reasonable cause a SystemExit with a clear message rather than OOM.
+- **Adversarial filesystem paths.** `--from` accepts only `.zip`, `.json`, or a directory containing `conversations.json`.
+
+### Anonymization
+
+- **Identifiers are HMAC-SHA256, not plain SHA-256.** The HMAC key is a 32-byte salt generated on first run (`~/.tokenmin/.salt`, chmod 0600) and stable across runs for cross-snapshot correlation. **Rainbow-table attacks fail** — an adversary who guesses `"~/.ssh/known_hosts"` cannot precompute its hash without the salt.
+- **16 hex chars (64 bits) of hash** — collision-resistant for any realistic corpus.
+- **Strict mode** (`TOKENMIN_STRICT_ANONYMIZE=1`) adds a per-run salt on top of the per-install salt, breaking even within-user cross-run correlation at the cost of losing "same file read 12× across days" findings.
+- **Whole-string hashing for paths and identifiers** — filename suffixes do not leak.
+- **Two-pass scrub** — label-hash known fields first, then free-text scrub remaining strings for paths, secrets, emails, IPs.
+
+### Transport
+
+- **HTTPS-only** for `--submit-url` (HTTP refused except for localhost).
+- **API keys read from env** (`--api-key-env VAR`) rather than the command line, where they'd be visible in `ps` and shell history. The legacy `--api-key` is still accepted but warns.
+- **No URL submission with `--no-anonymize`** — refused at the CLI.
+
+### Defaults
+
+- **`--no-anonymize` requires a second confirmation flag** (`--i-know-what-im-doing`).
+- **Snapshot files are written `chmod 0600`** and **refuse to overwrite existing files** without `--force`.
+- **No network access in the default `--out` mode** — the local engine runs in-process; nothing leaves the machine.
+
+### Update channel
+
+- **`git pull` over HTTPS** verifies TLS against the system trust store. To verify commit *authorship* (the missing piece in TLS alone), set `TOKENMIN_REQUIRE_SIGNED=1` — unsigned commits are then refused.
+- **Auto-update default is interactive prompt** — surprising silent pulls don't happen.
+- **5-second fetch timeout** — bad network never blocks a run.
+- **Dirty working tree skipped** — never clobbers local changes.
+
+### Audit log
+
+Every run appends a JSON line to `~/.tokenmin/audit.log` (mode 0600):
+
+```
+{"ts": "2026-05-23T20:00:00+00:00", "event": "snapshot_built", "source": "code",
+ "days": 30, "anonymized": true, "sessions": 53, "sha256": "abc...123"}
+{"ts": "2026-05-23T20:00:01+00:00", "event": "submit_start",
+ "url": "https://api.tokenmin.example/analyze", "sha256": "abc...123"}
+{"ts": "2026-05-23T20:00:02+00:00", "event": "submit_ok",
+ "url": "https://api.tokenmin.example/analyze", "sha256": "abc...123"}
+```
+
+The log records *what was sent* (by SHA-256 of the payload), *where*, and *when* — never user content. You can always reconstruct your submission history.
+
+## Cryptographic primitives
+
+| Use | Primitive |
+|---|---|
+| Identifier hashing | HMAC-SHA256, salt = 32 random bytes (per-install) [+ 32 random bytes per-run in strict mode], 64-bit truncation |
+| Audit-log payload digest | SHA-256 |
+| Transport | TLS (system trust store), plus commit-signature verification when `TOKENMIN_REQUIRE_SIGNED=1` |
+
+We do not roll our own crypto. Everything above is standard `hashlib` + `hmac` from the Python stdlib.
+
+## Known limitations
+
+We name these so you don't have to discover them.
+
+- **Truncated 64-bit hashes** are safe against rainbow tables (because of the salt) but theoretically vulnerable to a brute-force preimage by an adversary who already knows your salt. If your threat model includes adversaries who can read `~/.tokenmin/.salt`, you've already lost — your filesystem is compromised.
+- **The user-text keyword scan reads message content in memory** before discarding it. The count of matches survives; the text does not. A truly paranoid user has to trust that the open scanner code does what it says — which is why the scanner is open.
+- **A compromised maintainer GitHub account** could push a malicious commit. `TOKENMIN_REQUIRE_SIGNED=1` mitigates this if the user has the project signing key in their gpg keyring. We will publish the signing key fingerprint when the first signed release is cut.
+- **`curl … | bash`** is convenient but inherently trusts the network path to GitHub. Verify-then-run is documented in the install README. We are also working on a SHA-256 publish + checksum check for the installer itself.
+- **Auto-update fetches only `origin/main`** — if a user has manually pointed `origin` at a hostile fork, the update goes there. Hard to defend without changing the install model.
+
+## What's NOT in scope
+
+We don't claim to defend against:
+
+- A nation-state-grade adversary on the network with control of GitHub or PyPI
+- An attacker who already has code execution on your machine
+- Side-channel attacks (timing, memory access patterns) against the salt
+- The hosted engine being honest with your data (you trust the engine or you don't — that's the bargain)
+
+If your threat model includes those, Tokenmin isn't your tool.

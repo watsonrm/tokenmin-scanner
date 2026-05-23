@@ -27,7 +27,34 @@ fully functional without the engine — pass `--snapshot snap.json` to inspect
 what would be sent, and `--out report.md` only works if an engine is also
 installed.
 
+## Install — verify, then run
+
+The audit-first install (no `curl | bash`):
+
+```bash
+# 1. fetch the installer and its published checksum
+curl -fsSL -o install.sh https://raw.githubusercontent.com/watsonrm/rmwcommerce/main/tokenmin/install.sh
+curl -fsSL -o install.sh.sha256 https://raw.githubusercontent.com/watsonrm/rmwcommerce/main/tokenmin/install.sh.sha256
+
+# 2. verify the checksum
+shasum -a 256 -c install.sh.sha256
+
+# 3. (optional but recommended) read the script before running it
+less install.sh
+
+# 4. run it — public-scanner mode, no F&F credentials needed
+TOKENMIN_FF=0 bash install.sh
+```
+
+Quick path (trusts the network all the way to GitHub):
+
+```bash
+TOKENMIN_FF=0 curl -fsSL https://raw.githubusercontent.com/watsonrm/rmwcommerce/main/tokenmin/install.sh | bash
+```
+
 ## Two-minute audit
+
+After install, no network calls, no collection:
 
 ```bash
 git clone https://github.com/watsonrm/tokenmin-scanner.git

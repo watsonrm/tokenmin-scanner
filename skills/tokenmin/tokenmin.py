@@ -20,9 +20,13 @@ local-debug only and refuses to submit). See README.md for the trust posture.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
+import time
 from dataclasses import fields, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make sibling modules importable when run as a script.
@@ -164,6 +168,65 @@ def _emit_report(md: str, out: str | None) -> None:
             sys.stdout.write("\n")
 
 
+def _safe_write_json(path: Path, payload: dict, force: bool) -> None:
+    """Write JSON to path with mode 0600. Refuses to overwrite without --force."""
+    if path.exists() and not force:
+        raise SystemExit(
+            f"tokenmin: {path} already exists. Pass --force to overwrite, "
+            "or pick a different --snapshot path."
+        )
+    data = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    # Atomic write at 0600.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(path))
+
+
+def _audit_log(event: str, **fields_kv) -> None:
+    """Append a JSON line to ~/.tokenmin/audit.log.
+
+    Glasswing's "comprehensive logs" principle: the user should always be
+    able to reconstruct what tokenmin did on their machine, when, and what
+    bytes (by hash) it sent. The log is local, append-only, chmod 600.
+    No user content is logged — just event metadata and digests.
+    """
+    log_dir = Path.home() / ".tokenmin"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    log_path = log_dir / "audit.log"
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **fields_kv,
+    }
+    line = (json.dumps(record) + "\n").encode("utf-8")
+    try:
+        fd = os.open(
+            str(log_path),
+            os.O_CREAT | os.O_APPEND | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Logging failure is non-fatal.
+        pass
+
+
+def _payload_digest(payload: dict) -> str:
+    """SHA-256 of the canonical JSON form of the payload. For audit log."""
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -219,7 +282,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--no-anonymize",
         action="store_true",
-        help="Skip anonymization (local debugging only — refuses to --submit-url)",
+        help="DANGEROUS: skip anonymization. Local debugging only. Requires --i-know-what-im-doing.",
+    )
+    p.add_argument(
+        "--i-know-what-im-doing",
+        action="store_true",
+        help="Second confirmation flag required for --no-anonymize.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite --snapshot and --out paths if they exist.",
     )
     p.add_argument(
         "--keep-suffix",
@@ -256,6 +329,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    if args.no_anonymize and not args.i_know_what_im_doing:
+        print(
+            "tokenmin: --no-anonymize disables the only thing protecting your\n"
+            "data. If you really need a raw snapshot for debugging, also pass\n"
+            "--i-know-what-im-doing. It still refuses to --submit-url.",
+            file=sys.stderr,
+        )
+        return 3
     if args.no_anonymize and args.submit_url:
         print(
             "tokenmin: refusing to submit with --no-anonymize. Drop one of the flags.",
@@ -299,15 +380,32 @@ def main(argv: list[str] | None = None) -> int:
         snapshot = _label_scrub_pass(snapshot)
         snapshot = scrub_value(snapshot)
 
-    if args.snapshot:
-        Path(args.snapshot).write_text(
-            json.dumps(snapshot, indent=2, default=str), encoding="utf-8"
-        )
-        print(f"tokenmin: wrote anonymized snapshot to {args.snapshot}", file=sys.stderr)
+    digest = _payload_digest(snapshot)
+    _audit_log(
+        "snapshot_built",
+        source=args.source,
+        days=args.days,
+        anonymized=not args.no_anonymize,
+        sessions=len(snapshot.get("sessions") or []),
+        sha256=digest,
+    )
 
-    # Hand off to an engine to turn the snapshot into a report.
+    if args.snapshot:
+        _safe_write_json(Path(args.snapshot), snapshot, force=args.force)
+        print(
+            f"tokenmin: wrote anonymized snapshot to {args.snapshot} (chmod 0600)",
+            file=sys.stderr,
+        )
+
     if args.submit_url:
-        _emit_report(_submit(args.submit_url, api_key, snapshot), args.out)
+        _audit_log("submit_start", url=args.submit_url, sha256=digest)
+        try:
+            report = _submit(args.submit_url, api_key, snapshot)
+        except Exception as exc:
+            _audit_log("submit_error", url=args.submit_url, error=str(exc)[:200])
+            raise
+        _audit_log("submit_ok", url=args.submit_url, sha256=digest)
+        _emit_report(report, args.out)
         return 0
 
     engine = _local_engine()

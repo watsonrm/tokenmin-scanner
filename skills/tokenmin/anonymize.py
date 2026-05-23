@@ -14,16 +14,89 @@ want stronger guarantees, use --strict (per-run salt).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import secrets
 from pathlib import Path
 
-# A per-run salt makes hashes unstable across invocations — strictly anonymous,
-# at the cost of the engine losing cross-snapshot correlation. Default off
-# (engine wants stable IDs); enable with TOKENMIN_STRICT_ANONYMIZE=1.
+# Hashes are HMAC-SHA256(salt, value), NOT plain SHA-256. The salt is:
+#
+#   1. Per-INSTALL: 32 random bytes generated on first run at
+#      $TOKENMIN_SALT_PATH (default ~/.tokenmin/.salt, chmod 600).
+#      This kills the rainbow-table attack: an adversary who guesses
+#      "~/.ssh/known_hosts" can't precompute its hash without the salt.
+#      Cross-snapshot correlation still works WITHIN a user's data because
+#      the salt is stable, but cross-USER correlation is broken — same
+#      path gives different hashes for different users.
+#
+#   2. Per-RUN (optional, TOKENMIN_STRICT_ANONYMIZE=1): an additional
+#      random salt mixed in per process. Breaks WITHIN-user cross-run
+#      correlation too — strictly anonymous, at the cost of the engine
+#      losing "same file re-read across days" findings.
+#
+# Truncation length: 16 hex chars = 64 bits. Collision probability is
+# negligible for any realistic corpus (birthday-bound ~2^32 unique inputs
+# before any collision becomes likely).
+
+_HASH_HEX_LEN = 16
 _STRICT = os.environ.get("TOKENMIN_STRICT_ANONYMIZE") == "1"
-_RUN_SALT = secrets.token_hex(8) if _STRICT else ""
+_RUN_SALT = secrets.token_bytes(32) if _STRICT else b""
+
+
+def _salt_path() -> Path:
+    """Where the per-install salt lives. Override with TOKENMIN_SALT_PATH."""
+    env = os.environ.get("TOKENMIN_SALT_PATH")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".tokenmin" / ".salt"
+
+
+def _load_or_create_salt() -> bytes:
+    """Read the per-install salt, generating + persisting it on first run.
+
+    32 random bytes, written with mode 0600. If we can't write (read-only
+    install, permission denied), fall back to an in-memory ephemeral salt
+    — pseudonymization still works for this run, but cross-run correlation
+    is lost. We log this fact via stderr once.
+    """
+    path = _salt_path()
+    try:
+        if path.exists():
+            data = path.read_bytes()
+            if len(data) >= 32:
+                return data[:32]
+    except OSError:
+        pass
+    # Generate fresh.
+    salt = secrets.token_bytes(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # O_CREAT | O_WRONLY | O_EXCL with 0600 — atomic, refuses to overwrite.
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, salt)
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        # Race: another process created it. Read and use that one.
+        try:
+            return path.read_bytes()[:32]
+        except OSError:
+            return salt  # fall through to ephemeral
+    except OSError:
+        # Couldn't write — ephemeral salt for this run only.
+        import sys
+        print(
+            "tokenmin: warning: could not persist anonymization salt at "
+            f"{path}; using ephemeral salt for this run. Cross-run "
+            "correlation will be lost.",
+            file=sys.stderr,
+        )
+    return salt
+
+
+_INSTALL_SALT = _load_or_create_salt()
 
 
 # --- secret patterns --------------------------------------------------------
@@ -84,14 +157,39 @@ PATH_LIKE = re.compile(r"/?(?:[A-Za-z0-9._\-]+/){2,}[A-Za-z0-9._\-]+")
 MANGLED_PATH_LIKE = re.compile(r"\-[A-Za-z0-9]+(?:\-[A-Za-z0-9._]+){3,}")
 
 
-def _hash8(s: str) -> str:
-    return hashlib.sha256((_RUN_SALT + s).encode("utf-8")).hexdigest()[:8]
+def _hash(s: str) -> str:
+    """HMAC-SHA256 with the per-install salt (+ optional per-run salt), truncated to 16 hex.
+
+    Cryptographically defensible against rainbow-table de-anonymization:
+    without the salt, an adversary can't reverse a hash by guessing common
+    inputs.
+    """
+    key = _INSTALL_SALT + _RUN_SALT
+    return hmac.new(key, s.encode("utf-8"), hashlib.sha256).hexdigest()[:_HASH_HEX_LEN]
+
+
+# Backward-compat shim (kept for any external callers / tests).
+_hash8 = _hash
+
+
+# Defense-in-depth caps. Pathological inputs (zip-bomb session files, multi-MB
+# JSONL lines, deeply nested structures) shouldn't be able to hang the scrubber
+# in catastrophic regex backtracking or OOM the process.
+_MAX_SCRUB_LEN = 64 * 1024   # 64 KiB per string — anything larger is truncated.
+_MAX_DICT_DEPTH = 8          # already existed; documented now.
 
 
 def scrub_text(text: str) -> str:
-    """Scrub a free-text string. Idempotent."""
+    """Scrub a free-text string. Idempotent.
+
+    Inputs over _MAX_SCRUB_LEN are truncated with a marker. This prevents
+    regex catastrophic backtracking on adversarial inputs (e.g. session
+    files an attacker can plant in ~/.claude/projects/).
+    """
     if not text:
         return text
+    if len(text) > _MAX_SCRUB_LEN:
+        text = text[:_MAX_SCRUB_LEN] + "<truncated_by_scrubber>"
     out = text
     for pat, repl in PATTERNS:
         out = pat.sub(repl, out)

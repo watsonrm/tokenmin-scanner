@@ -54,15 +54,28 @@ maybe_update() {
     printf "tokenmin: update available (%s) but local tree has changes; skipping.\n" "${remote_sha:0:7}" >&2
     return 0
   fi
-  # Optional signature verification.
-  if [ "${TOKENMIN_REQUIRE_SIGNED:-0}" = "1" ]; then
-    local verify
-    verify="$(git -C "${here}" log -1 --pretty=%G? FETCH_HEAD 2>/dev/null || echo N)"
-    if [ "${verify}" != "G" ] && [ "${verify}" != "U" ]; then
-      printf "tokenmin: update available (%s) but commit signature did not verify (%s); skipping.\n" "${remote_sha:0:7}" "${verify}" >&2
-      return 0
-    fi
-  fi
+  # Signature verification. Default is "warn-and-continue" if no signature
+  # can be verified locally (most users won't have the maintainer's GPG key
+  # in their keyring), but TOKENMIN_REQUIRE_SIGNED=1 makes verification
+  # mandatory — recommended for security-sensitive users.
+  local sig_required="${TOKENMIN_REQUIRE_SIGNED:-warn}"
+  local verify
+  verify="$(git -C "${here}" log -1 --pretty=%G? FETCH_HEAD 2>/dev/null || echo N)"
+  case "${sig_required}" in
+    1|on|true|yes)
+      if [ "${verify}" != "G" ] && [ "${verify}" != "U" ]; then
+        printf "tokenmin: update available (%s) but commit signature did not verify (status=%s); skipping.\n" "${remote_sha:0:7}" "${verify}" >&2
+        printf "  (set TOKENMIN_REQUIRE_SIGNED=warn to allow unsigned updates.)\n" >&2
+        return 0
+      fi
+      ;;
+    warn|*)
+      if [ "${verify}" != "G" ] && [ "${verify}" != "U" ]; then
+        printf "tokenmin: note: incoming commit %s is unsigned or unverifiable locally (status=%s).\n" "${remote_sha:0:7}" "${verify}" >&2
+        printf "  set TOKENMIN_REQUIRE_SIGNED=1 to refuse unsigned updates.\n" >&2
+      fi
+      ;;
+  esac
   if [ "${mode}" = "prompt" ]; then
     # Only prompt if stderr is a tty; non-interactive runs skip silently.
     if [ -t 2 ]; then

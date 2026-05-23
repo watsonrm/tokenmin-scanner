@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .last-update-check
+# Per-install secrets and audit trails — never commit.
+.salt
+audit.log
