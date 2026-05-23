@@ -171,16 +171,46 @@ An adversary with the server-side telemetry corpus cannot reverse-derive
 the salt from install_id alone (it would require a hash-extension attack
 on HMAC-SHA256, which is infeasible).
 
-### Endpoint posture (when deployed)
+### Endpoint posture (F&F window)
 
-When the telemetry endpoint goes live, the server-side commitment will be:
+For the friends-and-family preview, the telemetry endpoint is a **private
+GitHub repo** at `watsonrm/tokenmin-telemetry`. Each event becomes a
+JSON-file commit at `events/YYYY-MM-DD/<timestamp>-<install_id_prefix>.json`
+via GitHub's Contents API. Settings.json carries:
+
+```json
+{
+  "telemetry_endpoint": "github://watsonrm/tokenmin-telemetry",
+  "telemetry_github_token": "github_pat_<scoped to that one repo>"
+}
+```
+
+The PAT is **fine-grained, scoped to `contents:write` on `tokenmin-telemetry`
+only**. Worst-case leak: someone with the PAT can spam the telemetry repo —
+they cannot read tokenmin source, cannot read other private repos, cannot
+read other users' data. Token rotates every 90 days; the rotation procedure
+is in `bin/mint-invite.sh` in the (private) `tokenmin-site` repo.
+
+The commit author for every event is a static identity
+(`tokenmin-telemetry <telemetry@tokenmin.ai>`) — never the F&F user's GitHub
+handle — so git history doesn't accidentally identify who sent what.
+
+Why GitHub as the F&F-window endpoint:
+- Zero new infrastructure to maintain during the iteration window
+- Read-time UX is `gh repo clone tokenmin-telemetry && jq -s '...' events/**/*.json`
+- Migration to a real worker (Cloudflare / Vercel / Fly) later is a single
+  field change in settings.json — JSON event shape is identical
+
+### Endpoint posture (when we exit F&F to public launch)
+
+For the public launch, a real worker will replace the GitHub endpoint:
 
 - HTTPS only; HTTP rejected at the edge
 - Request IP discarded at receive (not stored, not logged with the event)
 - Events stored aggregated by day, not per-request
 - Retention: 90 days for raw events; aggregates kept indefinitely
 - Endpoint URL stored in user's `~/.tokenmin/settings.json` — change it (or set to null) anytime
-- Endpoint code will be published in `watsonrm/tokenmin-scanner` for parity with the client trust story
+- Endpoint code will be published for parity with the client trust story
 
 ## Recent hardening — v0.8 security re-scan (2026-05-23)
 
