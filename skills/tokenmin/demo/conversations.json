@@ -1,0 +1,57 @@
+[
+  {
+    "uuid": "demo-conv-1",
+    "name": "Debugging a flaky test in our auth service",
+    "created_at": "2026-05-10T09:14:32Z",
+    "updated_at": "2026-05-10T10:42:11Z",
+    "chat_messages": [
+      {"sender": "human", "text": "this test has been intermittently failing for a week. logs attached. any ideas?", "created_at": "2026-05-10T09:14:32Z"},
+      {"sender": "assistant", "text": "the stack points at the session-expiry path. is the test using a real clock or a mocked one?", "created_at": "2026-05-10T09:14:55Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "real clock. you think that's it?", "created_at": "2026-05-10T09:15:30Z"},
+      {"sender": "assistant", "text": "almost certainly. switch to freezegun and the flakiness should disappear.", "created_at": "2026-05-10T09:15:50Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "wait, actually let me try mocking just the expiry function first instead of the whole clock", "created_at": "2026-05-10T09:16:45Z"},
+      {"sender": "assistant", "text": "that works too. narrower scope is better.", "created_at": "2026-05-10T09:17:01Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "ok done. test is passing locally now. ci pending.", "created_at": "2026-05-10T10:42:00Z"},
+      {"sender": "assistant", "text": "if it passes 100x in CI you're golden. otherwise come back with the next failure.", "created_at": "2026-05-10T10:42:11Z", "model": "claude-opus-4-7"}
+    ]
+  },
+  {
+    "uuid": "demo-conv-2",
+    "name": "Reformat this CSV",
+    "created_at": "2026-05-12T14:00:00Z",
+    "updated_at": "2026-05-12T14:02:00Z",
+    "chat_messages": [
+      {"sender": "human", "text": "reformat this CSV so all numbers are aligned right and headers are bold", "created_at": "2026-05-12T14:00:00Z"},
+      {"sender": "assistant", "text": "[reformatted CSV here]", "created_at": "2026-05-12T14:00:30Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "thanks", "created_at": "2026-05-12T14:02:00Z"}
+    ]
+  },
+  {
+    "uuid": "demo-conv-3",
+    "name": "Architecture review: new event-driven payment flow",
+    "created_at": "2026-05-15T11:30:00Z",
+    "updated_at": "2026-05-15T13:15:00Z",
+    "chat_messages": [
+      {"sender": "human", "text": "i'm designing a new payment-confirmation flow. should i use event sourcing or just direct DB writes? here are the constraints: [...]", "created_at": "2026-05-15T11:30:00Z"},
+      {"sender": "assistant", "text": "given those constraints (audit requirements + replayability), event sourcing buys you more than it costs here. but be careful about the read-model consistency story. let me walk through the tradeoffs.", "created_at": "2026-05-15T11:31:00Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "actually before we dive into tradeoffs, what's your one-line recommendation?", "created_at": "2026-05-15T11:33:00Z"},
+      {"sender": "assistant", "text": "event sourcing for the payment events themselves; a direct DB write for the user-facing 'order placed' confirmation, populated from the event stream by a read-model projection.", "created_at": "2026-05-15T11:33:40Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "ok walk me through it now", "created_at": "2026-05-15T11:34:00Z"},
+      {"sender": "assistant", "text": "[long architectural walkthrough]", "created_at": "2026-05-15T11:35:30Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "what about the failure-recovery case where the projection lags?", "created_at": "2026-05-15T11:50:00Z"},
+      {"sender": "assistant", "text": "[detailed recovery analysis]", "created_at": "2026-05-15T11:52:00Z", "model": "claude-opus-4-7"},
+      {"sender": "human", "text": "this is exactly what i needed. one more thing: how do i test it?", "created_at": "2026-05-15T13:10:00Z"},
+      {"sender": "assistant", "text": "[testing strategy section]", "created_at": "2026-05-15T13:14:00Z", "model": "claude-opus-4-7"}
+    ]
+  },
+  {
+    "uuid": "demo-conv-4",
+    "name": "Quick formatting question",
+    "created_at": "2026-05-18T08:30:00Z",
+    "updated_at": "2026-05-18T08:31:00Z",
+    "chat_messages": [
+      {"sender": "human", "text": "how do i center text in markdown", "created_at": "2026-05-18T08:30:00Z"},
+      {"sender": "assistant", "text": "markdown itself doesn't support centering; you'd need raw HTML: `<center>your text</center>` or `<p align=\"center\">your text</p>`.", "created_at": "2026-05-18T08:30:20Z", "model": "claude-opus-4-7"}
+    ]
+  }
+]

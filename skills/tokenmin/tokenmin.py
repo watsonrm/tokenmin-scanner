@@ -413,6 +413,10 @@ def main(argv: list[str] | None = None) -> int:
         return _render_show(argv[1])
     if argv and argv[0] == "watch":
         return _watch(argv[1:])
+    if argv and argv[0] == "demo":
+        return _demo()
+    if argv and argv[0] == "help-export":
+        return _help_export()
 
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -440,7 +444,12 @@ def main(argv: list[str] | None = None) -> int:
         "--from",
         dest="from_path",
         default=None,
-        help="Path to the chat export (.zip, directory, or conversations.json) — required for --source export",
+        help='Path to the chat export (.zip, directory, or conversations.json). Pass "latest" to auto-pick the newest Anthropic export zip in ~/Downloads/. Required for --source export unless --watch-downloads is set.',
+    )
+    p.add_argument(
+        "--watch-downloads",
+        action="store_true",
+        help="With --source export: poll ~/Downloads/ for a new Anthropic export zip and run automatically when one arrives. Ctrl-C exits.",
     )
     p.add_argument(
         "--claude-home",
@@ -570,14 +579,34 @@ def main(argv: list[str] | None = None) -> int:
         snap = collect_claude_code(home, days=days)
         _progress(f"found {len(snap.sessions)} sessions in last {days} days", done=True)
     elif args.source == "export":
+        # --watch-downloads short-circuits the main flow: it polls, then runs.
+        if args.watch_downloads:
+            return _watch_downloads_for_export(args.out, args.force)
         if not args.from_path:
             print(
-                "tokenmin: --source export requires --from PATH (the chat-export .zip).\n"
-                "Get the export from claude.ai or Claude Desktop: Settings -> Export data.",
+                "tokenmin: --source export needs either --from PATH or --watch-downloads.\n"
+                "  --from latest                      auto-pick newest Anthropic export in ~/Downloads/\n"
+                "  --from path/to/export.zip          explicit\n"
+                "  --watch-downloads                  wait for the next export to arrive\n"
+                "How to export: tokenmin help-export",
                 file=sys.stderr,
             )
             return 2
-        export_path = Path(args.from_path).expanduser()
+        # Resolve --from latest.
+        if args.from_path == "latest":
+            latest = _find_latest_export()
+            if latest is None:
+                print(
+                    "tokenmin: --from latest: no Anthropic export zip found in ~/Downloads/.\n"
+                    "  trigger one at https://claude.ai/settings/data-privacy-controls then\n"
+                    "  rerun (or use --watch-downloads to wait for it automatically).",
+                    file=sys.stderr,
+                )
+                return 2
+            export_path = latest
+            print(f"  --from latest -> {export_path.name}", file=sys.stderr)
+        else:
+            export_path = Path(args.from_path).expanduser()
         if not export_path.exists():
             print(f"tokenmin: {export_path} does not exist.", file=sys.stderr)
             return 2
@@ -588,6 +617,8 @@ def main(argv: list[str] | None = None) -> int:
         _progress(f"reading export {export_path}", done=False)
         snap = collect_from_export(export_path, days=days)
         _progress(f"parsed {len(snap.sessions)} conversations", done=True)
+        # Stash export path on the args object for the delete-after prompt.
+        args._export_source_path = export_path
     elif args.source == "desktop-native":
         snap = collect_from_desktop_native(None, days=30)
     else:
@@ -645,6 +676,12 @@ def main(argv: list[str] | None = None) -> int:
             _emit_report(result.get("report_md", ""), args.out)
         else:
             _render_terminal(result)
+
+        # For export-mode runs, offer to delete the source zip so raw chat
+        # data doesn't linger on disk. Trust signal for skeptical users.
+        export_src = getattr(args, "_export_source_path", None)
+        if export_src is not None:
+            _maybe_prompt_delete_export(export_src)
         return 0
 
     # --- fallback: legacy analyze() returning markdown only -----------------
@@ -794,6 +831,17 @@ def _render_terminal(result: dict) -> None:
 
     line = "─" * 72
 
+    # Detect export-mode: ConfigSnapshot is at defaults (no global settings).
+    # When this is true, we can't see /clear discipline, MCP setup, hooks, etc.
+    # Set honest expectations rather than under-deliver silently.
+    cfg = snap.get("config") or {}
+    is_export_mode = (
+        not cfg.get("has_global_claude_md")
+        and cfg.get("global_hook_count", 0) == 0
+        and cfg.get("projects_total", 0) == 0
+        and cost == 0  # exports don't carry token-cost data
+    )
+
     # Header card.
     print()
     print(f"  {c.BOLD}{c.MAGENTA}Tokenmin{c.RESET}  Claude usage audit")
@@ -801,6 +849,10 @@ def _render_terminal(result: dict) -> None:
     print(f"  scanned {c.BOLD}{sessions}{c.RESET} sessions over {days} days")
     print(f"  est. spend (window): {c.BOLD}{_fmt_money(cost)}{c.RESET}")
     print(f"  model mix: {c.DIM}{models_line}{c.RESET}")
+    if is_export_mode:
+        print(f"  {c.YELLOW}note:{c.RESET} {c.DIM}export-mode analysis. The export doesn't carry token counts,{c.RESET}")
+        print(f"        {c.DIM}local config (CLAUDE.md / hooks / MCP), or tool calls. For the{c.RESET}")
+        print(f"        {c.DIM}full picture, install Claude Code and rerun.{c.RESET}")
     print(f"  {c.GRAY}{line}{c.RESET}")
     print()
 
@@ -926,8 +978,14 @@ def _render_help() -> int:
     print(f"    {c.CYAN}tokenmin watch{c.RESET}                real-time spend + cache hit + sparkline (Ctrl-C to exit)")
     print(f"    {c.CYAN}tokenmin watch --alert 5{c.RESET}      beep when active session crosses $5")
     print()
+    print(f"  {c.BOLD}claude.ai / Claude Desktop (export-based)")
+    print(f"    {c.CYAN}tokenmin help-export{c.RESET}                step-by-step + browser deep-link")
+    print(f"    {c.CYAN}tokenmin --source export --from latest{c.RESET}  auto-pick newest ~/Downloads export")
+    print(f"    {c.CYAN}tokenmin --source export --watch-downloads{c.RESET}  wait for export to arrive")
+    print(f"    {c.CYAN}tokenmin demo{c.RESET}                       see a sample report without exporting")
+    print()
     print(f"  {c.BOLD}Variants{c.RESET}")
-    print(f"    {c.CYAN}tokenmin --source export --from FILE{c.RESET}    audit claude.ai or Desktop export")
+    print(f"    {c.CYAN}tokenmin --source export --from FILE{c.RESET}    audit a specific export file")
     print(f"    {c.CYAN}tokenmin --out report.md{c.RESET}                write full markdown report")
     print(f"    {c.CYAN}tokenmin --snapshot snap.json{c.RESET}           inspect anonymized payload")
     print(f"    {c.CYAN}tokenmin --submit-url URL{c.RESET}               send to hosted engine (HTTPS only)")
@@ -1345,6 +1403,202 @@ def _watch(args: list[str]) -> int:
         print("\033[?25h", end="", flush=True)
         print()
     return 0
+
+
+# --- demo / sample report --------------------------------------------------
+
+def _demo() -> int:
+    """Run a full tokenmin scan against a baked-in sample export. Shows the
+    user what a report looks like without requiring any real export from
+    claude.ai or Claude Desktop. No collection, no network."""
+    c = _C(_ansi_supported())
+    sample = Path(__file__).resolve().parent / "demo" / "conversations.json"
+    if not sample.exists():
+        print(f"tokenmin demo: sample fixture missing at {sample}", file=sys.stderr)
+        return 2
+    print(f"  {c.DIM}▶ running tokenmin against the bundled demo conversations...{c.RESET}", file=sys.stderr)
+    print(f"  {c.DIM}  (no collection, no network — this is a sample dataset){c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+    snap = collect_from_export(sample, days=90)
+    snapshot = _label_scrub_pass(_dataclass_to_dict(snap))
+    snapshot = scrub_value(snapshot)
+    structured_engine = _local_engine_structured()
+    if structured_engine is None:
+        print("tokenmin demo: no engine bundled — can't show a report.", file=sys.stderr)
+        print("  (you have the public scanner; for the engine, ask Rick for an F&F invite.)", file=sys.stderr)
+        return 0
+    result = structured_engine(snapshot)
+    _render_terminal(result)
+    print(file=sys.stderr)
+    print(f"  {c.DIM}^ this is the sample. for your real data:{c.RESET}", file=sys.stderr)
+    print(f"  {c.CYAN}tokenmin{c.RESET}                                    {c.DIM}# Claude Code{c.RESET}", file=sys.stderr)
+    print(f"  {c.CYAN}tokenmin --source export --from <export.zip>{c.RESET}  {c.DIM}# claude.ai or Desktop{c.RESET}", file=sys.stderr)
+    print(f"  {c.CYAN}tokenmin help-export{c.RESET}                        {c.DIM}# how to export your data{c.RESET}", file=sys.stderr)
+    return 0
+
+
+def _help_export() -> int:
+    """Step-by-step instructions for exporting from claude.ai or Claude Desktop,
+    plus an optional deep-link that opens the right page in the user's browser."""
+    import platform as _plat
+    c = _C(_ansi_supported())
+    EXPORT_URL = "https://claude.ai/settings/data-privacy-controls"
+    print()
+    print(f"  {c.BOLD}{c.MAGENTA}Exporting your Claude data{c.RESET}")
+    print()
+    print(f"  Both claude.ai and Claude Desktop use the same export flow.")
+    print()
+    print(f"  {c.BOLD}1.{c.RESET}  Sign in to claude.ai")
+    print(f"  {c.BOLD}2.{c.RESET}  Open Settings -> Privacy -> Data controls")
+    print(f"      direct link: {c.BLUE}{EXPORT_URL}{c.RESET}")
+    print(f"  {c.BOLD}3.{c.RESET}  Click 'Export data'")
+    print(f"  {c.BOLD}4.{c.RESET}  Anthropic emails the export zip when ready (usually minutes)")
+    print(f"  {c.BOLD}5.{c.RESET}  Download the zip (typically to ~/Downloads/)")
+    print(f"  {c.BOLD}6.{c.RESET}  Run:")
+    print(f"        {c.CYAN}tokenmin --source export --from ~/Downloads/data-export-*.zip{c.RESET}")
+    print(f"      or, to auto-pick the most recent Anthropic export:")
+    print(f"        {c.CYAN}tokenmin --source export --from latest{c.RESET}")
+    print()
+    print(f"  {c.BOLD}Watch-mode (run when the export arrives):{c.RESET}")
+    print(f"    {c.CYAN}tokenmin --source export --watch-downloads{c.RESET}")
+    print(f"    Polls ~/Downloads/ for new Anthropic export zips and runs")
+    print(f"    automatically when one shows up. Ctrl-C exits.")
+    print()
+    # On macOS, offer to open the export page.
+    if _plat.system() == "Darwin" and sys.stdin.isatty() and sys.stderr.isatty():
+        try:
+            print(f"  {c.DIM}Open the export page in your browser now? [y/N] {c.RESET}", end="")
+            sys.stderr.flush()
+            ans = input().strip().lower()
+            if ans in ("y", "yes"):
+                import subprocess
+                subprocess.run(["open", EXPORT_URL], check=False)
+                print(f"  {c.GREEN}✓{c.RESET} opened in browser")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    print()
+    return 0
+
+
+# --- --from latest / --watch-downloads helpers -----------------------------
+
+def _is_anthropic_export_name(name: str) -> bool:
+    """Strict-but-defensive: only file names that look like Anthropic chat
+    exports, NOT generic 'export' files from other services (LinkedIn,
+    Twitter, etc.).
+
+    Anthropic's export uses patterns like:
+      data-export-20260520T143000.zip
+      conversations.zip
+      claude-export-<uuid>.zip
+      anthropic-export-<...>.zip
+    """
+    n = name.lower()
+    return (
+        n == "conversations.zip"
+        or n.startswith("data-export-")
+        or n.startswith("claude-export")
+        or n.startswith("anthropic-export")
+    )
+
+
+def _find_latest_export(downloads_dir: Path | None = None) -> Path | None:
+    """Find the most recently modified Anthropic export zip in ~/Downloads/."""
+    if downloads_dir is None:
+        downloads_dir = Path.home() / "Downloads"
+    if not downloads_dir.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for p in downloads_dir.glob("*.zip"):
+        if _is_anthropic_export_name(p.name):
+            try:
+                candidates.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _watch_downloads_for_export(out_path: str | None, force: bool) -> int:
+    """Poll ~/Downloads/ until a new Anthropic export zip arrives, then run.
+
+    Idempotent — if an export already exists when started, runs against the
+    newest immediately. Otherwise polls until one appears.
+    """
+    c = _C(_ansi_supported())
+    downloads = Path.home() / "Downloads"
+    seen_at_start = {}
+    if downloads.is_dir():
+        for p in downloads.glob("*.zip"):
+            try:
+                seen_at_start[p] = p.stat().st_mtime
+            except OSError:
+                continue
+    initial = _find_latest_export(downloads)
+    if initial:
+        print(f"  {c.GREEN}✓{c.RESET} found existing export: {initial.name}", file=sys.stderr)
+        print(f"  {c.DIM}(running against it now; rerun with --watch-downloads for the next one){c.RESET}", file=sys.stderr)
+        return _run_export(initial, out_path, force)
+    print(f"  {c.DIM}▶ watching {downloads} for a new Anthropic export zip...{c.RESET}", file=sys.stderr)
+    print(f"  {c.DIM}  (Settings -> Privacy -> Export data on claude.ai. Ctrl-C to exit.){c.RESET}", file=sys.stderr)
+    try:
+        while True:
+            time.sleep(3)
+            if not downloads.is_dir():
+                continue
+            for p in downloads.glob("*.zip"):
+                try:
+                    mt = p.stat().st_mtime
+                except OSError:
+                    continue
+                if _is_anthropic_export_name(p.name) and (p not in seen_at_start or mt > seen_at_start[p]):
+                    print(f"  {c.GREEN}✓{c.RESET} export arrived: {p.name}", file=sys.stderr)
+                    return _run_export(p, out_path, force)
+                seen_at_start[p] = mt
+    except KeyboardInterrupt:
+        print(f"\n  {c.DIM}stopped watching.{c.RESET}", file=sys.stderr)
+        return 0
+
+
+def _run_export(export_path: Path, out_path: str | None, force: bool) -> int:
+    """Inline export run — shared between --from <path> and --watch-downloads paths."""
+    snap = collect_from_export(export_path, days=90)
+    snapshot = _label_scrub_pass(_dataclass_to_dict(snap))
+    snapshot = scrub_value(snapshot)
+    structured_engine = _local_engine_structured()
+    if structured_engine is None:
+        print("tokenmin: no engine bundled. Snapshot ready; pass --snapshot PATH or --submit-url to use it.", file=sys.stderr)
+        return 0
+    result = structured_engine(snapshot)
+    _save_last_run(result)
+    if out_path:
+        _emit_report(result.get("report_md", ""), out_path)
+    else:
+        _render_terminal(result)
+    _maybe_prompt_delete_export(export_path)
+    return 0
+
+
+def _maybe_prompt_delete_export(export_path: Path) -> None:
+    """After a successful export run, offer to delete the source zip so the
+    raw chat data doesn't linger on disk. Trust signal."""
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        return
+    c = _C(_ansi_supported())
+    try:
+        print()
+        print(f"  {c.DIM}delete the export file {export_path.name} now? "
+              f"(the snapshot kept by tokenmin is anonymized; the export is the raw source) [y/N] {c.RESET}",
+              end="", file=sys.stderr)
+        sys.stderr.flush()
+        ans = input().strip().lower()
+        if ans in ("y", "yes"):
+            export_path.unlink()
+            print(f"  {c.GREEN}✓{c.RESET} deleted {export_path}", file=sys.stderr)
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
 
 
 def _selftest() -> int:

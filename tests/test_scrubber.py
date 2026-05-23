@@ -144,6 +144,31 @@ class PropertyTests(unittest.TestCase):
             b = self._run_selfcheck(salt_path)
             self.assertEqual(a["labels"], b["labels"], "stable salt produced different hashes")
 
+    def test_is_anthropic_export_name_strict(self):
+        """--from latest / --watch-downloads must only match Anthropic exports,
+        not other services that happen to include 'export' in the filename
+        (LinkedIn, Twitter, generic). Real bug found in local testing."""
+        import importlib
+        sys.path.insert(0, str(SKILL_DIR))
+        m = importlib.import_module("tokenmin")
+        cases = [
+            ("conversations.zip", True),
+            ("data-export-20260520T143000.zip", True),
+            ("claude-export-abc.zip", True),
+            ("anthropic-export-xyz.zip", True),
+            ("CLAUDE-EXPORT-X.ZIP", True),  # case insensitive
+            ("Basic_LinkedInDataExport_08-21-2025.zip", False),
+            ("twitter-data-export.zip", False),
+            ("my-export.zip", False),
+            ("Conversations.zip", True),
+            ("random.zip", False),
+        ]
+        for name, expected in cases:
+            self.assertEqual(
+                m._is_anthropic_export_name(name), expected,
+                f"_is_anthropic_export_name({name!r}) -> {m._is_anthropic_export_name(name)}, want {expected}"
+            )
+
     def test_strip_ctl_blocks_ansi_injection(self):
         """ANSI escape codes and control chars get stripped from displayed text.
         Defense against adversarial filenames / project dirs that could hijack
