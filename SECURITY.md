@@ -99,6 +99,87 @@ Every run appends a JSON line to `~/.tokenmin/audit.log` (mode 0600):
 
 The log records *what was sent* (by SHA-256 of the payload), *where*, and *when* — never user content. You can always reconstruct your submission history.
 
+## Telemetry (v0.10+)
+
+Tokenmin sends a fixed-fields anonymous usage signal so we can rank detectors
+by real-world fire rate and surface install / crash bugs. The full per-field
+dictionary is enumerated below — read it once, decide if you trust the trade.
+
+### Defaults
+
+| Install path | Telemetry default | Why |
+|---|---|---|
+| F&F invite (`tokenmin.ai/i/<code>/install.sh`) | **On** | F&F bargain already includes "free for anonymized data"; the installer pre-seeds `~/.tokenmin/settings.json` |
+| Public scanner (`tokenmin.ai/install.sh`) | **Off, asked on first interactive run** | Same iPhone-Diagnostics-style consent: full disclosure + explicit y/N + easy reversal |
+
+### Always-respected overrides
+
+- `TOKENMIN_NO_TELEMETRY=1` env var — wins over anything in settings.json
+- `tokenmin telemetry off` — permanent disable, persisted to settings
+- No endpoint configured — events are formed but not transmitted (the default ship state today; an endpoint will be added when one is deployed)
+
+### What's sent — fixed list
+
+One event per `tokenmin` run, at the end. Schema `tokenmin.telemetry.v1`:
+
+| Field | Example | Why |
+|---|---|---|
+| `schema` | `"tokenmin.telemetry.v1"` | schema versioning |
+| `sent_at` | `"2026-05-23T22:30:00Z"` | request timing |
+| `install_id` | `"98aae1d4566e5b27"` | HMAC-derived from your salt + a separate "install-id-v1" tag. **Not the salt itself; not your anonymization hash output** — different value space so it can never reveal a path or filename. Lets us dedupe a single install across daily events without re-identifying you. |
+| `version` | `"0.10.0"` | bug routing |
+| `platform` | `"Darwin 25.4.0"` | compatibility |
+| `python_version` | `"3.12"` | compatibility |
+| `subcommand` | `"run"`, `"watch"`, `"show"`, `"demo"` | feature usage ranking |
+| `findings_fired` | `["model_overspend","no_output_style"]` | detector ranking — **id list only, never the values** |
+| `session_count_bucket` | `"1-10"`, `"11-100"`, `"101+"` | corpus shape, bucketed so exact count can't fingerprint |
+| `models_used_families` | `{"opus": 52, "sonnet": 3}` | population model mix — family only, no version IDs |
+| `error` (only on exception) | `{"class": "OSError", "loc": "tokenmin.py:412"}` | crash signal — class name + source line, **never the message, never the path** |
+
+### What's never sent
+
+- The snapshot itself
+- File paths, project names, MCP server names — anything from `~/.claude/`
+- Raw error messages, exception arguments, tracebacks beyond a class+line stub
+- Your IP (the server-side endpoint, when one exists, will discard the request IP at the edge)
+- Your email, GitHub handle, machine name, user name
+
+### Inspect for yourself
+
+```
+tokenmin telemetry dry-run
+```
+
+Prints the exact JSON payload that WOULD be sent for a representative run.
+No collection, no network — pure dry-run.
+
+```
+tokenmin telemetry status
+```
+
+Shows current state (on / off / unset), endpoint, env-var override, and the
+install_id that would identify this install.
+
+### Cryptographic discipline
+
+`install_id` derives from `HMAC-SHA256(install_salt, "install-id-v1")[:16]`.
+Different tag from the anonymization-hash output (`HMAC-SHA256(install_salt,
+<value>)`), so the install_id can never collide with a path or label hash.
+An adversary with the server-side telemetry corpus cannot reverse-derive
+the salt from install_id alone (it would require a hash-extension attack
+on HMAC-SHA256, which is infeasible).
+
+### Endpoint posture (when deployed)
+
+When the telemetry endpoint goes live, the server-side commitment will be:
+
+- HTTPS only; HTTP rejected at the edge
+- Request IP discarded at receive (not stored, not logged with the event)
+- Events stored aggregated by day, not per-request
+- Retention: 90 days for raw events; aggregates kept indefinitely
+- Endpoint URL stored in user's `~/.tokenmin/settings.json` — change it (or set to null) anytime
+- Endpoint code will be published in `watsonrm/tokenmin-scanner` for parity with the client trust story
+
 ## Recent hardening — v0.8 security re-scan (2026-05-23)
 
 After shipping the install-path rewrite (v0.5), B2 client redesign (v0.5–0.7),

@@ -6,3 +6,5 @@ __pycache__/
 /.salt
 /audit.log
 /.git-credentials
+/settings.json
+/last_run.json

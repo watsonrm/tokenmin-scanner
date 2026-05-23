@@ -417,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
         return _demo()
     if argv and argv[0] == "help-export":
         return _help_export()
+    if argv and argv[0] == "telemetry":
+        return _telemetry_cmd(argv[1:])
 
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -562,6 +564,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.submit_url:
         _check_submit_url(args.submit_url)
 
+    # First-run telemetry consent (no-op when already decided, or non-interactive,
+    # or F&F-pre-configured). Never asks for runs that won't produce findings.
+    _maybe_telemetry_consent()
+
     # Resolve --days. Accept "auto" (default) or an integer string. For code
     # source, peek at session count to auto-scale the window.
     if args.source == "code":
@@ -676,6 +682,23 @@ def main(argv: list[str] | None = None) -> int:
             _emit_report(result.get("report_md", ""), args.out)
         else:
             _render_terminal(result)
+
+        # Telemetry: send the event if enabled. Silent on every failure mode.
+        if _telemetry_enabled():
+            try:
+                snap_info = result.get("snapshot") or {}
+                families = {}
+                for m in snap_info.get("models") or []:
+                    families[m["name"].lower()] = m.get("share", 0)
+                event = _build_telemetry_event(
+                    subcommand="run",
+                    findings_fired=[f["id"] for f in (result.get("findings") or [])],
+                    session_count=snap_info.get("sessions", 0),
+                    models_used_families=families,
+                )
+                _send_telemetry(event)
+            except Exception:
+                pass
 
         # For export-mode runs, offer to delete the source zip so raw chat
         # data doesn't linger on disk. Trust signal for skeptical users.
@@ -994,6 +1017,7 @@ def _render_help() -> int:
     print(f"    {c.CYAN}tokenmin --version{c.RESET}            what you're running")
     print(f"    {c.CYAN}tokenmin doctor{c.RESET}               self-diagnose")
     print(f"    {c.CYAN}tokenmin selftest{c.RESET}             run the bundled tests")
+    print(f"    {c.CYAN}tokenmin telemetry status{c.RESET}     view telemetry state (off / on / dry-run)")
     print(f"    {c.CYAN}tokenmin uninstall{c.RESET}            clean removal")
     print()
     print(f"  {c.BOLD}What gets collected and what doesn't{c.RESET}")
@@ -1621,6 +1645,226 @@ def _selftest() -> int:
     print(f"tokenmin selftest: running {runner}")
     res = subprocess.run(["bash", str(runner)], cwd=str(root))
     return res.returncode
+
+
+# --- settings + telemetry --------------------------------------------------
+#
+# Telemetry is a strictly-bounded, fixed-fields signal to help improve the
+# detector ranking and surface real install / crash bugs. The full per-field
+# dictionary is enumerated in `_TELEMETRY_FIELDS_DOC` below and mirrored in
+# SECURITY.md.
+#
+# Posture:
+#   - F&F invitees:    default ON (the per-invite installer sets it at install)
+#   - Public scanner:  default OFF, first-run consent flow asks once
+#   - TOKENMIN_NO_TELEMETRY=1 always wins, regardless of settings
+#   - `tokenmin telemetry off` disables permanently
+#   - `tokenmin telemetry dry-run` prints what would be sent without sending
+#   - Endpoint failures are silent (telemetry is non-critical)
+#
+# Privacy invariants:
+#   - Never send: snapshot, file paths, project names, raw error messages,
+#     user-agent / IP (server-side discards), email, model-specific identifiers
+#   - install_id is HMAC-derived from the per-install salt + a separate
+#     "install-id-v1" tag, NOT the salt itself — different value space so the
+#     anonymization hash and the install_id never collide.
+
+_SETTINGS_PATH = Path.home() / ".tokenmin" / "settings.json"
+
+
+def _load_settings() -> dict:
+    try:
+        return json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_settings(s: dict) -> None:
+    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(s, indent=2, sort_keys=True).encode("utf-8")
+    tmp = _SETTINGS_PATH.with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(_SETTINGS_PATH))
+
+
+def _telemetry_install_id() -> str:
+    """Derive a stable per-install ID from the salt, in a different value
+    space than the anonymization hash so the two can never collide."""
+    import hmac as _hmac
+    try:
+        from anonymize import _INSTALL_SALT
+    except Exception:
+        return "unknown"
+    return _hmac.new(_INSTALL_SALT, b"install-id-v1", hashlib.sha256).hexdigest()[:16]
+
+
+def _telemetry_enabled() -> bool:
+    if os.environ.get("TOKENMIN_NO_TELEMETRY"):
+        return False
+    s = _load_settings()
+    return s.get("telemetry") == "on"
+
+
+def _telemetry_endpoint() -> str | None:
+    """Where to POST telemetry. None means 'don't send' — events are still
+    formed and the dry-run flag still works, just nothing transmits."""
+    s = _load_settings()
+    return s.get("telemetry_endpoint")
+
+
+def _build_telemetry_event(
+    *,
+    subcommand: str,
+    findings_fired: list[str] | None = None,
+    session_count: int | None = None,
+    models_used_families: dict | None = None,
+    error: tuple[str, str] | None = None,
+) -> dict:
+    import platform as _plat
+    install_id = _telemetry_install_id()
+    info = _version_info()
+    event = {
+        "schema": "tokenmin.telemetry.v1",
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "install_id": install_id,
+        "version": info.get("version") or "dev",
+        "platform": f"{_plat.system()} {_plat.release()}",
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "subcommand": subcommand,
+    }
+    if findings_fired is not None:
+        event["findings_fired"] = sorted(findings_fired)
+    if session_count is not None:
+        # Bucket so the exact number can't fingerprint usage intensity.
+        if session_count == 0:      event["session_count_bucket"] = "0"
+        elif session_count <= 10:    event["session_count_bucket"] = "1-10"
+        elif session_count <= 100:   event["session_count_bucket"] = "11-100"
+        else:                        event["session_count_bucket"] = "101+"
+    if models_used_families is not None:
+        # Family only — Opus/Sonnet/Haiku/Other, no version IDs.
+        event["models_used_families"] = {
+            k: int(v) for k, v in models_used_families.items()
+        }
+    if error is not None:
+        cls, loc = error
+        event["error"] = {"class": cls, "loc": loc}  # never the message itself
+    return event
+
+
+def _send_telemetry(event: dict) -> None:
+    """POST a telemetry event to the configured endpoint. Silent on every
+    failure mode — telemetry must never break a real run."""
+    endpoint = _telemetry_endpoint()
+    if not endpoint:
+        return  # no endpoint configured = no transmission
+    try:
+        import urllib.request
+        from urllib.parse import urlparse
+        scheme = urlparse(endpoint).scheme
+        if scheme != "https":
+            return  # never send over plaintext
+        payload = json.dumps(event).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+
+def _maybe_telemetry_consent() -> None:
+    """First-run consent ask for public-scanner installs. F&F invitees have
+    `telemetry: on` pre-set by the installer and skip this. Public users see
+    this on their first interactive `tokenmin` invocation."""
+    s = _load_settings()
+    if s.get("telemetry") in ("on", "off"):
+        return  # already decided
+    if s.get("telemetry_consent_asked"):
+        return  # asked once before — don't nag
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return  # non-interactive: leave it null, defer to a later interactive run
+    c = _C(_ansi_supported())
+    print(f"\n  {c.BOLD}{c.MAGENTA}Tokenmin{c.RESET} can send anonymous usage stats to improve the rule base.", file=sys.stderr)
+    print(f"  {c.DIM}This is separate from the audit snapshot you already control with --submit-url.{c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  {c.BOLD}What's sent (per invocation):{c.RESET}", file=sys.stderr)
+    print(f"    - tokenmin version + platform + python version", file=sys.stderr)
+    print(f"    - which subcommand you ran (run / watch / show / demo / etc.)", file=sys.stderr)
+    print(f"    - which detectors fired (id only, never the values)", file=sys.stderr)
+    print(f"    - session count bucketed (0 / 1-10 / 11-100 / 101+)", file=sys.stderr)
+    print(f"    - model families used (Opus/Sonnet/Haiku — no version IDs)", file=sys.stderr)
+    print(f"    - error class + source line on exceptions (no message, no paths)", file=sys.stderr)
+    print(f"    - a stable install_id (HMAC of your salt — can't be reversed to identify you)", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  {c.BOLD}Never sent:{c.RESET} the snapshot, file paths, project names, raw errors, IP, email.", file=sys.stderr)
+    print(f"  Inspect what would go: {c.CYAN}tokenmin telemetry dry-run{c.RESET}", file=sys.stderr)
+    print(f"  Change anytime:        {c.CYAN}tokenmin telemetry on|off{c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  Enable? [y/N] ", end="", file=sys.stderr)
+    sys.stderr.flush()
+    try:
+        ans = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    s["telemetry"] = "on" if ans in ("y", "yes") else "off"
+    s["telemetry_consent_asked"] = True
+    _save_settings(s)
+    c = _C(_ansi_supported())
+    if s["telemetry"] == "on":
+        print(f"  {c.GREEN}✓{c.RESET} telemetry enabled. {c.DIM}Disable anytime with `tokenmin telemetry off`.{c.RESET}", file=sys.stderr)
+    else:
+        print(f"  {c.DIM}telemetry disabled. Enable later with `tokenmin telemetry on`.{c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
+def _telemetry_cmd(args: list[str]) -> int:
+    """tokenmin telemetry on|off|status|dry-run"""
+    import argparse as _ap
+    sp = _ap.ArgumentParser(prog="tokenmin telemetry")
+    sp.add_argument("action", choices=("on", "off", "status", "dry-run"))
+    a = sp.parse_args(args)
+    c = _C(_ansi_supported())
+    s = _load_settings()
+    if a.action == "on":
+        s["telemetry"] = "on"
+        s["telemetry_consent_asked"] = True
+        _save_settings(s)
+        print(f"{c.GREEN}✓{c.RESET} telemetry enabled")
+        return 0
+    if a.action == "off":
+        s["telemetry"] = "off"
+        s["telemetry_consent_asked"] = True
+        _save_settings(s)
+        print(f"{c.GREEN}✓{c.RESET} telemetry disabled")
+        return 0
+    if a.action == "status":
+        state = s.get("telemetry", "unset (will ask on first interactive run)")
+        endpoint = s.get("telemetry_endpoint") or "(none configured — events not transmitted)"
+        env_override = "yes" if os.environ.get("TOKENMIN_NO_TELEMETRY") else "no"
+        print(f"  telemetry:           {c.BOLD}{state}{c.RESET}")
+        print(f"  endpoint:            {endpoint}")
+        print(f"  TOKENMIN_NO_TELEMETRY env override: {env_override}")
+        print(f"  install_id:          {_telemetry_install_id()}")
+        print(f"  settings file:       {_SETTINGS_PATH}")
+        print()
+        print(f"  inspect what gets sent: {c.CYAN}tokenmin telemetry dry-run{c.RESET}")
+        return 0
+    if a.action == "dry-run":
+        # Build a representative event for the most common case (a tokenmin run).
+        event = _build_telemetry_event(
+            subcommand="run",
+            findings_fired=["model_overspend", "no_output_style", "long_sessions_no_clear"],
+            session_count=57,
+            models_used_families={"opus": 52, "sonnet": 3},
+        )
+        print("# This is the EXACT payload tokenmin would POST to the endpoint.")
+        print("# Telemetry is only transmitted if `telemetry: on` AND an endpoint is configured.")
+        print(json.dumps(event, indent=2, sort_keys=True))
+        return 0
+    return 2
 
 
 def _uninstall(args: list[str]) -> int:
