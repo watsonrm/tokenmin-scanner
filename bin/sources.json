@@ -1,5 +1,6 @@
 {
   "_doc": "Curated source list for tokenmin's detector-research watcher. PRs welcome to add a source — open an issue first so we can confirm the trust signal. Each source declares its tier (1=Anthropic first-party, auto-trusted; 2=verified community, curated allowlist) and a trust_reason that has to be more than vibes.",
+  "_todo": "code.claude.com/docs and platform.claude.com/docs were tried as html-index sources on 2026-05-24 and removed: the docs URL structure has no article-vs-nav distinction, so the watcher fired on section landing pages. They need a content-diff watcher (hash specific high-value pages like /docs/en/whats-new, /docs/en/best-practices, /docs/en/costs and surface diffs), not a URL-discovery watcher. Filed for follow-up.",
   "sources": [
     {
       "name": "anthropic-news",
@@ -19,25 +20,7 @@
       "tier": 1,
       "trust_reason": "Anthropic's engineering blog — token-usage and pattern posts ship here. Auto-trusted."
     },
-    {
-      "name": "anthropic-code-docs",
-      "type": "html-index",
-      "base_url": "https://code.claude.com",
-      "index_url": "https://code.claude.com/docs",
-      "slug_prefix": "/docs/en/",
-      "tier": 1,
-      "trust_reason": "Canonical Claude Code docs. Manage-costs, best-practices, subagents, hooks all live here. Auto-trusted."
-    },
-    {
-      "name": "anthropic-api-docs",
-      "type": "html-index",
-      "base_url": "https://platform.claude.com",
-      "index_url": "https://platform.claude.com/docs",
-      "slug_prefix": "/docs/en/",
-      "tier": 1,
-      "trust_reason": "Canonical Claude API docs. Prompt-caching, parallel-tool-use, MCP guides live here. Auto-trusted."
-    },
-    {
+{
       "name": "claude-code-releases",
       "type": "github-releases",
       "repo": "anthropics/claude-code",
