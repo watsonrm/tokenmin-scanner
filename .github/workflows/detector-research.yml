@@ -1,0 +1,65 @@
+name: detector-research
+
+# Watches public Anthropic + ecosystem sources for new Claude usage / optimization
+# patterns and opens a tokenmin-scanner issue per newly-seen post for human triage.
+#
+# Runs WEEKLY in the cloud (GitHub Actions) — survives laptop shutdown by design.
+# The script lives at bin/detector-research.py; state at bin/.research-seen.json.
+
+on:
+  schedule:
+    # Mondays at 13:23 UTC. Off the :00/:30 minute marks so we don't slam the
+    # cron fleet at the round-hour like everyone else.
+    - cron: '23 13 * * 1'
+  workflow_dispatch: {}  # manual trigger for the first run + debugging
+
+permissions:
+  contents: write   # to commit the updated .research-seen.json
+  issues: write     # to file the per-source candidate issues
+
+concurrency:
+  group: detector-research
+  cancel-in-progress: false
+
+jobs:
+  scan-and-file:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure 'research-candidate' label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh label list --repo "${GITHUB_REPOSITORY}" --search research-candidate \
+              | grep -q '^research-candidate'; then
+            gh label create research-candidate \
+              --repo "${GITHUB_REPOSITORY}" \
+              --description "Auto-filed by detector-research; review for tokenmin detector ideas" \
+              --color "C5DEF5" || true
+          fi
+
+      - name: Run detector-research
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 bin/detector-research.py
+
+      - name: Commit updated seen state (if changed)
+        run: |
+          set -euo pipefail
+          if [[ -z "$(git status --porcelain bin/.research-seen.json)" ]]; then
+            echo "no state changes; nothing to commit"
+            exit 0
+          fi
+          git config user.name  "tokenmin-detector-research"
+          git config user.email "tokenmin-research@users.noreply.github.com"
+          git add bin/.research-seen.json
+          git commit -m "research: update seen state ($(date -u +%Y-%m-%d))"
+          git push
