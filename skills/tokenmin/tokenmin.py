@@ -279,8 +279,92 @@ def _version_info() -> dict:
     return info
 
 
+def _update_status(force_refresh: bool = False, timeout_sec: int = 3) -> dict:
+    """Check whether a newer tokenmin is available on origin/main.
+
+    Returns dict with keys: current_version, current_sha, latest_version,
+    latest_sha, up_to_date, checked_at, error.
+
+    Result cached in ~/.tokenmin/.update-status for 1 hour (forced refresh
+    bypasses cache). Skips silently on no-network / no-git / dirty errors —
+    error is non-empty when the check itself failed but never raises.
+    """
+    import subprocess as _sp
+    root = _install_dir()
+    cache = root / ".update-status"
+    info = _version_info()
+    current_version = info.get("version", "dev")
+    current_sha = info.get("commit", "")
+
+    # Cache check — short-circuit when not forced and within 1h.
+    if not force_refresh and cache.is_file():
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            ts = cached.get("checked_at", "")
+            if ts:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+                if age < 3600:
+                    return cached
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    result = {
+        "current_version": current_version,
+        "current_sha": current_sha,
+        "latest_version": None,
+        "latest_sha": None,
+        "up_to_date": None,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "error": "",
+    }
+
+    if not (root / ".git").is_dir():
+        result["error"] = "not a git repo (scanner-only install or manually copied)"
+        return result
+    try:
+        # ls-remote is read-only and doesn't change the working tree.
+        proc = _sp.run(
+            ["git", "-C", str(root), "ls-remote", "--quiet", "origin", "main"],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            result["error"] = "ls-remote failed (offline? auth?)"
+            return result
+        remote_sha = proc.stdout.split()[0]
+    except (OSError, _sp.TimeoutExpired) as exc:
+        result["error"] = f"git error: {exc}"
+        return result
+
+    result["latest_sha"] = remote_sha
+    result["up_to_date"] = (remote_sha == current_sha) if current_sha else None
+
+    # Fetch the VERSION file from the remote ref (without merging). Use
+    # cat-file with --no-pager-style direct read.
+    try:
+        # Need the remote object first — fetch it shallow.
+        _sp.run(
+            ["git", "-C", str(root), "fetch", "--quiet", "--depth", "1", "origin", remote_sha],
+            capture_output=True, timeout=timeout_sec,
+        )
+        proc = _sp.run(
+            ["git", "-C", str(root), "show", f"{remote_sha}:VERSION"],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+        if proc.returncode == 0:
+            result["latest_version"] = proc.stdout.strip()
+    except (OSError, _sp.TimeoutExpired):
+        pass
+
+    try:
+        cache.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return result
+
+
 def _print_version() -> int:
     info = _version_info()
+    c = _C(_ansi_supported())
     if "version" in info:
         print(f"tokenmin {info['version']}")
     else:
@@ -293,6 +377,132 @@ def _print_version() -> int:
         print(f"  remote:  {info['remote']}")
     print(f"  install: {_install_dir()}")
     print(f"  python:  {sys.version.split()[0]}")
+
+    # v0.12.5: surface "you're behind" right here so users don't have to dig.
+    # Best-effort: skips silently on no-network.
+    try:
+        status = _update_status()
+        if status.get("up_to_date") is False:
+            latest = status.get("latest_version") or "newer"
+            latest_sha = (status.get("latest_sha") or "")[:7]
+            print()
+            print(f"  {c.YELLOW}update available:{c.RESET} {c.BOLD}{latest}{c.RESET} "
+                  f"({latest_sha}) — run {c.CYAN}tokenmin update{c.RESET}")
+        elif status.get("up_to_date") is True:
+            print(f"  status:  {c.GREEN}up to date{c.RESET}")
+    except Exception:
+        pass
+    return 0
+
+
+def _update_cmd(args: list[str]) -> int:
+    """tokenmin update — explicit, immediate, bypasses the 24h cooldown.
+
+    Reports old SHA → new SHA + version. Refuses on a dirty tree (the user
+    has local edits) or when TOKENMIN_AUTOUPDATE=off. Honors
+    TOKENMIN_REQUIRE_SIGNED=1 the same way the bash wrapper does.
+    """
+    import argparse as _ap
+    import subprocess as _sp
+    sp = _ap.ArgumentParser(prog="tokenmin update", description="Pull the latest tokenmin into ~/.tokenmin.")
+    sp.add_argument("--check", action="store_true", help="Check only; don't pull")
+    a = sp.parse_args(args)
+    c = _C(_ansi_supported())
+    root = _install_dir()
+
+    if os.environ.get("TOKENMIN_AUTOUPDATE", "").lower() == "off" and not a.check:
+        print(f"{c.YELLOW}!{c.RESET} TOKENMIN_AUTOUPDATE=off — update refused.", file=sys.stderr)
+        print(f"  unset the env var or run with `TOKENMIN_AUTOUPDATE=auto tokenmin update`.", file=sys.stderr)
+        return 1
+
+    if not (root / ".git").is_dir():
+        print(f"{c.YELLOW}!{c.RESET} {root} isn't a git checkout; can't update.", file=sys.stderr)
+        print(f"  reinstall via the F&F invite or public install URL to refresh.", file=sys.stderr)
+        return 1
+
+    # Force-refresh status (bypass cache).
+    status = _update_status(force_refresh=True)
+    if status.get("error"):
+        print(f"{c.YELLOW}!{c.RESET} update check failed: {status['error']}", file=sys.stderr)
+        return 1
+    current_sha = status.get("current_sha", "")
+    latest_sha = status.get("latest_sha", "")
+    latest_version = status.get("latest_version") or "?"
+    current_version = status.get("current_version") or "?"
+
+    if status.get("up_to_date"):
+        print(f"{c.GREEN}✓{c.RESET} tokenmin {current_version} is the latest. Nothing to do.")
+        return 0
+
+    if a.check:
+        print(f"  current: {c.BOLD}{current_version}{c.RESET} ({current_sha[:7]})")
+        print(f"  latest:  {c.BOLD}{latest_version}{c.RESET} ({latest_sha[:7]})")
+        print(f"  run {c.CYAN}tokenmin update{c.RESET} to apply.")
+        return 0
+
+    # Refuse if working tree is dirty.
+    try:
+        dirty = _sp.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            print(f"{c.YELLOW}!{c.RESET} working tree at {root} has local changes; refusing to update.", file=sys.stderr)
+            print(f"  inspect with `cd {root} && git status` and reset before retrying.", file=sys.stderr)
+            return 1
+    except (OSError, _sp.TimeoutExpired):
+        pass
+
+    # Optional signature verification (matches the bash wrapper's logic).
+    if os.environ.get("TOKENMIN_REQUIRE_SIGNED", "").lower() in ("1", "on", "true", "yes"):
+        try:
+            verify = _sp.run(
+                ["git", "-C", str(root), "log", "-1", "--pretty=%G?", latest_sha],
+                capture_output=True, text=True, timeout=5,
+            )
+            v = verify.stdout.strip()
+            if v not in ("G", "U"):
+                print(f"{c.YELLOW}!{c.RESET} commit {latest_sha[:7]} signature did not verify (status={v}); refusing.", file=sys.stderr)
+                print(f"  unset TOKENMIN_REQUIRE_SIGNED to allow unsigned updates.", file=sys.stderr)
+                return 1
+        except (OSError, _sp.TimeoutExpired):
+            pass
+
+    print(f"  pulling {current_sha[:7]} → {latest_sha[:7]}...")
+    try:
+        pull = _sp.run(
+            ["git", "-C", str(root), "merge", "--ff-only", "--quiet", latest_sha],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, _sp.TimeoutExpired) as exc:
+        print(f"{c.YELLOW}!{c.RESET} merge failed: {exc}", file=sys.stderr)
+        return 1
+    if pull.returncode != 0:
+        print(f"{c.YELLOW}!{c.RESET} merge --ff-only failed:", file=sys.stderr)
+        print(pull.stderr or pull.stdout, file=sys.stderr)
+        return 1
+
+    # Reset the wrapper's 24h cooldown so it doesn't double-update next run.
+    stamp = root / ".last-update-check"
+    try:
+        stamp.write_text(str(int(datetime.now(timezone.utc).timestamp())))
+    except OSError:
+        pass
+    # Clear the status cache so the next --version check sees fresh state.
+    try:
+        (root / ".update-status").unlink()
+    except OSError:
+        pass
+
+    # Re-read VERSION post-merge so the success line is accurate.
+    new_version = current_version
+    try:
+        vfile = root / "VERSION"
+        if vfile.is_file():
+            new_version = vfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    print(f"{c.GREEN}✓{c.RESET} tokenmin updated to {c.BOLD}{new_version}{c.RESET} ({latest_sha[:7]})")
     return 0
 
 
@@ -369,9 +579,22 @@ def _doctor() -> int:
     else:
         line("engine", "not bundled (public scanner only — no reports without --submit-url)", True)
 
-    # Auto-update setting
+    # Auto-update setting + actual update status (v0.12.5).
     au_mode = os.environ.get("TOKENMIN_AUTOUPDATE", "prompt")
     line("auto-update", f"{au_mode} (env: TOKENMIN_AUTOUPDATE)")
+    # Best-effort status check — silent on network failure.
+    try:
+        st = _update_status()
+        if st.get("up_to_date") is True:
+            line("update status", "up to date")
+        elif st.get("up_to_date") is False:
+            latest = st.get("latest_version") or "newer"
+            line("update status", f"{latest} available — run `tokenmin update`", False)
+        else:
+            err = st.get("error") or "unknown"
+            line("update status", f"check skipped ({err})")
+    except Exception:
+        pass
 
     # PATH check (best-effort — only reliable when invoked via the wrapper)
     bin_link = Path.home() / ".local" / "bin" / "tokenmin"
@@ -421,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
         return _telemetry_cmd(argv[1:])
     if argv and argv[0] == "plan":
         return _plan_cmd(argv[1:])
+    if argv and argv[0] == "update":
+        return _update_cmd(argv[1:])
 
     p = argparse.ArgumentParser(
         prog="tokenmin",

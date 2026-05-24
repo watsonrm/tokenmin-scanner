@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for v0.12.5's update UX — `tokenmin update`, `--version` "behind"
+hint, and `tokenmin doctor` update-status line.
+
+The current UX gap Rick caught:
+  - 24h cooldown means users sit a day behind without knowing
+  - `--version` only printed local SHA — no "you're behind by N" hint
+  - No `tokenmin update` command (the stale-pricing message lied)
+  - `doctor` showed the mode but not actual status
+
+v0.12.5 ships:
+  - `_update_status()` — cached-1h check against origin/main
+  - `tokenmin update` — explicit, bypasses cooldown, dirty-tree-safe
+  - `--version` surfaces "update available: vX.Y.Z" when behind
+  - `doctor` adds `update status:` line
+
+These tests cover the contract without hitting the real network (subprocess
+calls are mocked so CI is deterministic + offline-safe).
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SKILL_DIR = REPO_ROOT / "skills" / "tokenmin"
+ENGINE_DIR = REPO_ROOT / "engine"
+sys.path.insert(0, str(SKILL_DIR))
+sys.path.insert(0, str(ENGINE_DIR))
+
+import tokenmin  # noqa: E402
+
+
+class UpdateStatusContract(unittest.TestCase):
+    """`_update_status()` returns a stable schema, never raises."""
+
+    def test_returns_required_keys(self):
+        with unittest.mock.patch.object(
+            tokenmin, "_install_dir",
+            return_value=Path(tempfile.mkdtemp()),
+        ):
+            s = tokenmin._update_status(force_refresh=True, timeout_sec=1)
+        for key in ("current_version", "current_sha", "latest_version",
+                    "latest_sha", "up_to_date", "checked_at", "error"):
+            self.assertIn(key, s)
+
+    def test_handles_non_git_install_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(
+                tokenmin, "_install_dir",
+                return_value=Path(tmp),
+            ):
+                s = tokenmin._update_status(force_refresh=True, timeout_sec=1)
+            self.assertIn("not a git repo", s["error"])
+            self.assertIsNone(s["up_to_date"])
+
+    def test_caches_within_1h_when_not_forced(self):
+        # Pre-seed a cache file with a recent timestamp, confirm we return the
+        # cached value without re-fetching from origin. (Can't assert "no
+        # subprocess" because _version_info() itself shells out to git for
+        # local metadata; what matters is the *remote* check is skipped.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / ".update-status").write_text(json.dumps({
+                "current_version": "9.9.9",
+                "current_sha": "abc1234",
+                "latest_version": "9.9.9",
+                "latest_sha": "abc1234",
+                "up_to_date": True,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "error": "",
+            }))
+            ls_remote_called = []
+            real_run = subprocess.run
+            def watching_run(cmd, *a, **kw):
+                if isinstance(cmd, list) and "ls-remote" in cmd:
+                    ls_remote_called.append(cmd)
+                return real_run(cmd, *a, **kw)
+            with unittest.mock.patch.object(tokenmin, "_install_dir",
+                                            return_value=root), \
+                 unittest.mock.patch("subprocess.run", side_effect=watching_run):
+                s = tokenmin._update_status(force_refresh=False)
+            self.assertEqual(s["current_version"], "9.9.9")
+            self.assertTrue(s["up_to_date"])
+            self.assertEqual(ls_remote_called, [],
+                             "cache hit must skip the network ls-remote call")
+
+    def test_force_refresh_bypasses_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / ".update-status").write_text(json.dumps({
+                "current_version": "stale", "current_sha": "old",
+                "latest_version": "stale", "latest_sha": "old",
+                "up_to_date": True,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "error": "",
+            }))
+            # Simulate ls-remote returning a brand new sha.
+            def fake_run(cmd, *a, **kw):
+                if "ls-remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "newsha1234567 refs/heads/main\n", "")
+                if "show" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "0.99.0\n", "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with unittest.mock.patch.object(tokenmin, "_install_dir",
+                                            return_value=root), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                s = tokenmin._update_status(force_refresh=True)
+            self.assertEqual(s["latest_sha"], "newsha1234567")
+            self.assertEqual(s["latest_version"], "0.99.0")
+            self.assertFalse(s["up_to_date"])
+
+
+class UpdateCommandBehavior(unittest.TestCase):
+    """`tokenmin update` exit codes + safety rails."""
+
+    def test_refuses_when_autoupdate_off(self):
+        with unittest.mock.patch.dict("os.environ", {"TOKENMIN_AUTOUPDATE": "off"}), \
+             unittest.mock.patch.object(sys, "stderr", new_callable=__import__("io").StringIO) as err:
+            rc = tokenmin._update_cmd([])
+        self.assertEqual(rc, 1)
+        self.assertIn("TOKENMIN_AUTOUPDATE=off", err.getvalue())
+
+    def test_check_flag_does_not_pull(self):
+        # --check should print status but never invoke `git merge`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            def fake_run(cmd, *a, **kw):
+                if "ls-remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "newsha refs/heads/main\n", "")
+                if "show" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "0.99.0\n", "")
+                if "merge" in cmd:
+                    self.fail("--check must not invoke `git merge`")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "0.1.0", "commit": "oldsha"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+                 unittest.mock.patch.dict("os.environ", {}, clear=False):
+                rc = tokenmin._update_cmd(["--check"])
+            self.assertEqual(rc, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

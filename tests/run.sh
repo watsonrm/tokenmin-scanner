@@ -27,4 +27,6 @@ python3 "${here}/test_cost_framing.py"
 echo
 python3 "${here}/test_v0_12_4.py"
 echo
+python3 "${here}/test_update_ux.py"
+echo
 echo "tokenmin tests: ok"
