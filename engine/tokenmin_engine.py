@@ -1,20 +1,19 @@
-"""Tokenmin engine — adapter implementing the scanner's engine contract.
+"""Tokenmin engine — adapter implementing the open client's engine contract.
 
-SPDX-License-Identifier: Apache-2.0
+PROPRIETARY. Not part of the open client (Apache-2.0). See engine/LICENSE.
 
-The scanner CLI (`skills/tokenmin/tokenmin.py`) hands the engine an anonymized
-snapshot as a plain dict and expects Markdown back:
+The open client (tokenmin.py) hands the engine an anonymized snapshot as a plain
+dict and expects Markdown back:
 
     tokenmin_engine.analyze(snapshot: dict) -> str
 
-This module reconstructs the scanner's `Snapshot` dataclasses from that dict
-(the dict was produced by `tokenmin.py`'s `_dataclass_to_dict`: Counters became
-dicts, sets became sorted lists), runs the detection rule base, and renders the
-report.
+This module reconstructs the open client's `Snapshot` dataclasses from that dict
+(the dict was produced by tokenmin.py's `_dataclass_to_dict`: Counters became dicts,
+sets became sorted lists), runs the detection rule base, and renders the report.
 
-It depends on the scanner's `analyzer` module for the schema definitions —
-that is the intended architecture: the engine consumes the scanner's
-`Snapshot` contract; it does not redefine it.
+It depends on the open client's `analyzer` module for the schema definitions —
+that is the intended architecture: the proprietary engine consumes the open
+client's `Snapshot` contract; it does not redefine it.
 """
 from __future__ import annotations
 
@@ -49,6 +48,17 @@ def _session_from_dict(d: dict) -> SessionStats:
     s.cache_read_tokens = d.get("cache_read_tokens", 0)
     s.est_cost_usd = d.get("est_cost_usd", 0.0)
     s.redo_signals = d.get("redo_signals", 0)
+    # v0.12.6 — new per-session fields. Default 0 / empty so older snapshots
+    # serialized by pre-0.12.6 clients still round-trip cleanly.
+    s.bash_file_ops = d.get("bash_file_ops", 0)
+    s.cache_thrash_events = d.get("cache_thrash_events", 0)
+    s.thinking_bloat_turns = d.get("thinking_bloat_turns", 0)
+    s.hook_event_chars = d.get("hook_event_chars", 0)
+    s.hook_event_fires = d.get("hook_event_fires", 0)
+    s.denied_patterns = Counter(d.get("denied_patterns") or {})
+    s.compacts = d.get("compacts", 0)
+    s.compact_then_died = d.get("compact_then_died", 0)
+    s.opus_compactions = d.get("opus_compactions", 0)
     return s
 
 

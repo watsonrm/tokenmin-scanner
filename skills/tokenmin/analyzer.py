@@ -71,6 +71,20 @@ class SessionStats:
     cache_read_tokens: int = 0
     est_cost_usd: float = 0.0
     redo_signals: int = 0  # "actually", "no wait", "instead", "undo"
+    # v0.12.6 — new aggregate fields for the second-wave detectors.
+    # Each one is a per-session counter populated in the JSONL walk;
+    # detectors aggregate across sessions.
+    bash_file_ops: int = 0  # Bash commands matching cat/ls/head/tail/sed/awk/grep/find against a path
+    cache_thrash_events: int = 0  # turns where prior gap was 5-55 min AND this turn paid full cache-creation cost
+    thinking_bloat_turns: int = 0  # turns with >8K output but <=1 Edit/Write AND no Agent AND short visible message
+    hook_event_chars: int = 0  # cumulative chars of detected hook output (heuristic — see analyzer comment)
+    hook_event_fires: int = 0
+    denied_patterns: Counter = field(default_factory=Counter)  # normalized tool/Bash pattern -> deny count
+    compacts: int = 0  # /compact invocations detected in user messages
+    compact_then_died: int = 0  # /compact followed by session end within <=3 assistant turns
+    opus_compactions: int = 0  # /compact turns where active model was Opus AND input was large (>50K)
+    last_assistant_at: float | None = None  # internal — for gap math; not used outside analyzer
+    turns_since_last_compact: int = -1  # internal — -1 = no compact yet this session
 
 
 @dataclass
@@ -147,6 +161,21 @@ _REDO_HINTS = (
 )
 
 _LONG_SEARCH_TOOLS = {"Grep", "Glob", "find", "Bash"}
+
+# v0.12.6 — Bash commands that should have been dedicated tools (Read/Glob/Grep).
+# Matches the START of the command (after optional whitespace). Catches things like
+#   cat /etc/hosts
+#   ls -la src/
+#   head -n 100 logs/foo.log
+#   grep -r 'foo' src/
+#   sed -n '1,50p' file.txt
+# Doesn't catch piped uses (`some_other_cmd | grep ...`) — those are legitimate
+# bash pipelines, not file-read substitutes.
+import re as _re
+_BASH_FILE_OP_PAT = _re.compile(
+    r"^(cat|ls|head|tail|sed|awk|grep|find)(\s+|$)",
+    _re.IGNORECASE,
+)
 
 
 _MAX_JSONL_FILE = 50 * 1024 * 1024   # skip files > 50 MiB outright
@@ -248,6 +277,27 @@ def parse_session(jsonl_path: Path, project_name: str, cutoff: float | None) -> 
             text = _user_text(event)
             if any(h in text for h in _REDO_HINTS):
                 stats.redo_signals += 1
+            # v0.12.6: detect /compact invocations (user issues the command).
+            # Detection uses the user-visible text — Claude Code transcripts
+            # echo the slash command as the user message body.
+            stripped = text.strip()
+            if stripped.startswith("/compact") and (len(stripped) == 8 or stripped[8] in " \n\t"):
+                stats.compacts += 1
+                stats.turns_since_last_compact = 0
+            # v0.12.6 (heuristic): detect inline hook output.
+            # Claude Code wraps hook output in user-message content blocks with
+            # tags like <local-command-stdout> or <command-...-output>. We count
+            # the cumulative char volume so the hook_token_burner detector has
+            # a signal. Marked as HEURISTIC in the detector's confidence (0.4).
+            for marker in ("<local-command-stdout>", "<local-command-stderr>",
+                           "<command-stdout>", "<command-stderr>"):
+                idx = text.find(marker)
+                if idx >= 0:
+                    end_tag = marker.replace("<", "</")
+                    end_idx = text.find(end_tag, idx)
+                    if end_idx > idx:
+                        stats.hook_event_chars += (end_idx - idx - len(marker))
+                        stats.hook_event_fires += 1
 
         if etype == "assistant" or event.get("message", {}).get("role") == "assistant":
             stats.assistant_turns += 1
@@ -263,11 +313,44 @@ def parse_session(jsonl_path: Path, project_name: str, cutoff: float | None) -> 
                     it * pi + ot * po + cw * pcw + cr * pcr
                 ) / 1_000_000
 
+            # v0.12.6 detector signals on this assistant turn:
+
+            # cache_thrash_short_gaps — turn resumed past TTL but within 1h: paying
+            # write cost when a 1h TTL hint or /clear discipline would have made
+            # this a read. Gap must be 5-55 min AND cache_creation must dominate.
+            if stats.last_assistant_at is not None and t is not None:
+                gap = t - stats.last_assistant_at
+                if 300 < gap < 3600 and cw > 0 and cr < cw // 4:
+                    stats.cache_thrash_events += 1
+            stats.last_assistant_at = t
+
+            # opus_for_compaction — the turn immediately after /compact was run by
+            # the user. If that turn used Opus AND input was >50K tokens AND it
+            # consumed substantial cache_creation, this is the compaction summary
+            # on a premium model.
+            if stats.turns_since_last_compact == 0:
+                model_l = (model or "").lower()
+                if "opus" in model_l and (it + cw) > 50_000:
+                    stats.opus_compactions += 1
+            if stats.turns_since_last_compact >= 0:
+                stats.turns_since_last_compact += 1
+
+            # thinking_bloat — measure visible output text + non-tool action
+            # surface against output_tokens. If output_tokens is large but visible
+            # content + Edit/Write/Agent calls are small, thinking-token budget
+            # was burned on a turn that didn't justify it.
+            visible_chars = 0
+            edit_write = 0
+            agent_calls = 0
+
             # walk tool uses
             for b in _content_blocks(event):
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "tool_use":
+                btype = b.get("type")
+                if btype == "text":
+                    visible_chars += len(b.get("text", ""))
+                if btype == "tool_use":
                     tool = b.get("name", "unknown")
                     stats.tool_calls[tool] += 1
                     tools_in_current_turn += 1
@@ -286,9 +369,20 @@ def parse_session(jsonl_path: Path, project_name: str, cutoff: float | None) -> 
                         fp = inp.get("file_path")
                         if fp:
                             stats.files_written.add(fp)
+                        edit_write += 1
                     elif tool == "Agent":
                         sub = inp.get("subagent_type", "general-purpose")
                         stats.agents_used[sub] += 1
+                        agent_calls += 1
+                    elif tool == "Bash":
+                        # bash_cat_instead_of_read — Claude shells out via Bash
+                        # for file reads instead of using Read/Glob/Grep.
+                        cmd = (inp.get("command") or "").lstrip()
+                        if _BASH_FILE_OP_PAT.match(cmd):
+                            stats.bash_file_ops += 1
+
+            if ot > 8000 and edit_write <= 1 and agent_calls == 0 and visible_chars < 500:
+                stats.thinking_bloat_turns += 1
 
         # tool_result errors / permission denies
         if etype == "tool_result" or "tool_use_id" in event:
@@ -297,8 +391,20 @@ def parse_session(jsonl_path: Path, project_name: str, cutoff: float | None) -> 
                 content = " ".join(
                     b.get("text", "") for b in content if isinstance(b, dict)
                 )
-            if "permission" in content.lower() and "deni" in content.lower():
+            content_l = content.lower() if isinstance(content, str) else ""
+            if "permission" in content_l and "deni" in content_l:
                 stats.permission_denies += 1
+                # v0.12.6 — capture the normalized pattern of what got denied so
+                # the permission_denies_loop detector can suggest a real `permissions.deny`
+                # entry rather than just "you got denied N times."
+                # Heuristic: tool_result content for a denial often references the
+                # tool name (e.g. "Permission denied for Bash: rm -rf /tmp/X").
+                # Normalize Bash patterns to "Bash: <first-token> ..." so similar
+                # invocations cluster.
+                snippet = content[:200] if isinstance(content, str) else ""
+                pat = _normalize_denied_pattern(snippet)
+                if pat:
+                    stats.denied_patterns[pat] += 1
             if event.get("is_error"):
                 stats.error_results += 1
 
@@ -306,7 +412,30 @@ def parse_session(jsonl_path: Path, project_name: str, cutoff: float | None) -> 
         return None
     if tools_in_current_turn:
         stats.tools_per_turn.append(tools_in_current_turn)
+    # v0.12.6 — compact_then_die: if the session ended within <=3 assistant turns
+    # of a /compact invocation, the compact was wasted (user should have /clear-ed).
+    if 0 < stats.turns_since_last_compact <= 3:
+        stats.compact_then_died += 1
     return stats
+
+
+def _normalize_denied_pattern(snippet: str) -> str:
+    """Reduce a deny tool_result snippet to a clusterable key.
+
+    Examples:
+      "Permission denied for Bash: rm -rf /tmp/foo" -> "Bash: rm"
+      "Permission denied for Write: /etc/passwd"    -> "Write"
+    Returns "" if no recognizable tool name found.
+    """
+    m = _re.search(r"(?:for|in|on)?\s*(Bash|Write|Edit|Read|Grep|Glob|Agent|MultiEdit)\b[:\s]*(\S+)?",
+                   snippet, _re.IGNORECASE)
+    if not m:
+        return ""
+    tool = m.group(1).capitalize()
+    arg = (m.group(2) or "")[:30].rstrip("/")
+    if not arg:
+        return tool
+    return f"{tool}: {arg}"
 
 
 # --- config snapshot --------------------------------------------------------
