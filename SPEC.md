@@ -1,23 +1,22 @@
 ---
-title: "Tokenmin open client — design spec, data model, trust posture, hand-off protocol"
+title: "Tokenmin — design spec, data model, trust posture, hand-off protocol"
 status: spec
 type: spec
-version: 0.2
-date: 2026-05-23
-note: "This spec covers the OPEN CLIENT only. The detection rule base, scoring, report rendering, and processing engine are proprietary and specified in the separate private repo. See LICENSING.md."
-tags: [spec, tokenmin, claude-code, open-client, local-only]
+version: 0.3
+date: 2026-05-24
+note: "Tokenmin is Apache-2.0 across the board (scanner + engine + server skeleton). See LICENSING.md for the file layout."
+tags: [spec, tokenmin, claude-code, local-first]
 ---
 
-# Tokenmin open client — design spec
+# Tokenmin — design spec
 
 ## What this is
 
-Tokenmin is hybrid-licensed (see [LICENSING.md](LICENSING.md)). This document
-specifies the **open client** — the Apache-2.0 half that runs on the user's
-machine to collect Claude Code usage, anonymize it, and hand it to the Tokenmin
-engine. The client holds **no detection rules**: it cannot produce a finding on
-its own. Findings come from the proprietary Tokenmin engine, deployed either as a
-local closed module or as the hosted service.
+Tokenmin is Apache-2.0 across the board (see [LICENSING.md](LICENSING.md)). This
+document specifies the architecture: scanner (collector + anonymizer + CLI) and
+engine (detection rule base + report renderer) running locally as a single tool.
+A future opt-in hosted endpoint is on the roadmap (`ROADMAP.md`); for now every
+install is fully self-contained.
 
 ## Architecture
 
@@ -37,8 +36,8 @@ boundary stage (anonymize) that must run before any hand-off.
                               ┌────────────────────────┼────────────────────────┐
                               ▼                         ▼                         ▼
                        --snapshot PATH           local engine             --submit-url
-                       (write JSON,            (proprietary module,      (HTTPS POST to
-                        no engine)              if installed)             hosted engine)
+                       (write JSON,            (engine/ in this repo,    (HTTPS POST to
+                        no engine)              the default path)         a hosted endpoint)
                               │                         │                         │
                               ▼                         ▼                         ▼
                        snap.json               report (Markdown)         report (Markdown)
@@ -117,9 +116,9 @@ The client produces an anonymized `Snapshot` (serialized to JSON via
 
 - **`--snapshot PATH`** — write the JSON and stop. This is the exact payload an
   engine would see; useful for auditing what leaves the machine.
-- **Local engine** — if a proprietary `tokenmin_engine` module is importable, the
-  client calls `tokenmin_engine.analyze(snapshot: dict) -> str` and displays the
-  returned Markdown. No network.
+- **Local engine** — the default path. The client imports `tokenmin_engine` from
+  `engine/` in this repo and calls `tokenmin_engine.analyze(snapshot: dict) -> str`,
+  displaying the returned Markdown. No network.
 - **`--submit-url URL`** (+ optional `--api-key`) — POST `{"snapshot": ...}` as
   JSON with an optional `Authorization: Bearer` header. The response is the
   report (Markdown directly, or `{"report": "..."}`). Refused if `--no-anonymize`.
@@ -164,22 +163,27 @@ findings need the engine. See [SKILL.md](skills/tokenmin/SKILL.md), which encode
 trust rules (anonymize before send; never quote raw content; never invent
 findings; refuse if `~/.claude/projects/` is empty).
 
-## What lives in the proprietary core (not here)
+## Engine surface (in `engine/`)
 
-For completeness, the boundary (full detail in [LICENSING.md](LICENSING.md)):
+The engine lives at `engine/` in this repo (Apache-2.0). See
+[LICENSING.md](LICENSING.md) for the file layout.
 
-- Detection rule base — every detector and its logic.
-- Scoring / ranking — the formula that orders findings.
-- Report rendering — turning findings into the Markdown report.
-- Processing engine — both deployment forms (local closed module, hosted service).
-- Server infrastructure — submission endpoint, auth, storage, cross-corpus
-  benchmarking, team-mode aggregation.
+- Detection rule base — `engine/patterns.py`. Every detector and its logic.
+- Scoring / ranking — `engine/patterns.py:Finding.score()`.
+- Report rendering — `engine/report.py`. Turns findings into the Markdown report.
+- Engine entry points — `engine/tokenmin_engine.py:analyze` (Markdown) and
+  `analyze_structured` (structured findings + Markdown).
+- Pricing lookup — `engine/pricing.py` + `engine/pricing.json`.
+- Local HTTP server skeleton — `server/tokenmin_server.py`. Useful for testing
+  the `--submit-url` path against a local endpoint. A production hosted
+  endpoint is on the roadmap (`ROADMAP.md`).
 
-The open client is designed so that none of the above is required for it to
-collect and anonymize correctly — only to turn the result into advice.
+The scanner is designed so the engine and server can both be replaced or
+delegated to a remote service without the scanner caring.
 
 ## Cross-references
 
-- [LICENSING.md](LICENSING.md) — the open/proprietary boundary
+- [LICENSING.md](LICENSING.md) — file layout and trust posture
+- [ROADMAP.md](ROADMAP.md) — what's next
 - [Anthropic — Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills) — the SKILL.md format the `/tokenmin` surface uses
 - [Anthropic — CLAUDE.md memory docs](https://code.claude.com/docs/en/memory.md)

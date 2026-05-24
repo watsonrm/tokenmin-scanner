@@ -30,7 +30,7 @@ We will not pursue legal action against good-faith researchers who:
 
 ## Supported versions
 
-During the friends-and-family preview, **the `main` branch of `watsonrm/tokenmin-scanner` is the only supported version.** All security fixes land there first.
+During the preview phase, **the `main` branch of `watsonrm/tokenmin-scanner` is the only supported version.** All security fixes land there first.
 
 Auto-update default is interactive-prompt; users on `TOKENMIN_AUTOUPDATE=auto` get fixes within hours, users on prompt within a day, users on `off` only when they manually pull. If you operate Tokenmin at scale or in a security-sensitive environment, set `TOKENMIN_AUTOUPDATE=auto` *and* `TOKENMIN_REQUIRE_SIGNED=1`.
 
@@ -107,10 +107,8 @@ dictionary is enumerated below — read it once, decide if you trust the trade.
 
 ### Defaults
 
-| Install path | Telemetry default | Why |
-|---|---|---|
-| F&F invite (`tokenmin.ai/i/<code>/install.sh`) | **On** | F&F bargain already includes "free for anonymized data"; the installer pre-seeds `~/.tokenmin/settings.json` |
-| Public scanner (`tokenmin.ai/install.sh`) | **Off, asked on first interactive run** | Same iPhone-Diagnostics-style consent: full disclosure + explicit y/N + easy reversal |
+**Off by default; asked on first interactive run.** Same iPhone-Diagnostics-style
+consent: full disclosure (the field list below) + explicit y/N + easy reversal.
 
 ### Always-respected overrides
 
@@ -171,39 +169,13 @@ An adversary with the server-side telemetry corpus cannot reverse-derive
 the salt from install_id alone (it would require a hash-extension attack
 on HMAC-SHA256, which is infeasible).
 
-### Endpoint posture (F&F window)
+### Endpoint posture
 
-For the friends-and-family preview, the telemetry endpoint is a **private
-GitHub repo** at `watsonrm/tokenmin-telemetry`. Each event becomes a
-JSON-file commit at `events/YYYY-MM-DD/<timestamp>-<install_id_prefix>.json`
-via GitHub's Contents API. Settings.json carries:
+Today, no default telemetry endpoint ships. Events are formed but not
+transmitted unless a user explicitly opts in and points
+`telemetry_endpoint` in `~/.tokenmin/settings.json` at a URL.
 
-```json
-{
-  "telemetry_endpoint": "github://watsonrm/tokenmin-telemetry",
-  "telemetry_github_token": "github_pat_<scoped to that one repo>"
-}
-```
-
-The PAT is **fine-grained, scoped to `contents:write` on `tokenmin-telemetry`
-only**. Worst-case leak: someone with the PAT can spam the telemetry repo —
-they cannot read tokenmin source, cannot read other private repos, cannot
-read other users' data. Token rotates every 90 days; the rotation procedure
-is in `bin/mint-invite.sh` in the (private) `tokenmin-site` repo.
-
-The commit author for every event is a static identity
-(`tokenmin-telemetry <telemetry@tokenmin.ai>`) — never the F&F user's GitHub
-handle — so git history doesn't accidentally identify who sent what.
-
-Why GitHub as the F&F-window endpoint:
-- Zero new infrastructure to maintain during the iteration window
-- Read-time UX is `gh repo clone tokenmin-telemetry && jq -s '...' events/**/*.json`
-- Migration to a real worker (Cloudflare / Vercel / Fly) later is a single
-  field change in settings.json — JSON event shape is identical
-
-### Endpoint posture (when we exit F&F to public launch)
-
-For the public launch, a real worker will replace the GitHub endpoint:
+When a hosted endpoint is deployed (see [ROADMAP.md](ROADMAP.md)) it will be:
 
 - HTTPS only; HTTP rejected at the edge
 - Request IP discarded at receive (not stored, not logged with the event)

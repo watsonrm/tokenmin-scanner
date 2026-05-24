@@ -8,7 +8,7 @@
 		{
 			"name": "tokenmin",
 			"source": "./",
-			"description": "Tokenmin scanner — Apache-2.0 collector + anonymizer for Claude usage. Audit-able by design. Detection engine is separately licensed (watsonrm/tokenmin-core).",
+			"description": "Tokenmin — Apache-2.0 scanner + engine that audits how you use Claude and recommends concrete improvements. Reads ~/.claude, anonymizes locally, never sends anything off-machine by default.",
 			"version": "0.3.0",
 			"author": {
 				"name": "Rick Watson",

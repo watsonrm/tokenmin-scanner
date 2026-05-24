@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Tokenmin. Open client CLI.
+"""Tokenmin CLI.
 
-This is the open-source half of Tokenmin: it collects your Claude Code usage,
-anonymizes it, and hands the anonymized snapshot to the Tokenmin engine. It holds
-no detection rules of its own — findings come from the proprietary Tokenmin engine,
-which runs either locally (a separately-installed closed module) or at the
-hosted service. See LICENSING.md for the open/proprietary boundary.
+Collects your Claude Code usage, anonymizes it, and hands the anonymized
+snapshot to the Tokenmin engine (which ships in `engine/` next door, Apache-2.0
+like the rest of this repo). See LICENSING.md for the file layout.
 
 Usage:
     python3 tokenmin.py --snapshot snap.json        # write anonymized snapshot, no engine
-    python3 tokenmin.py --out report.md             # local engine (if installed) → report
-    python3 tokenmin.py --submit-url URL --api-key K --out report.md   # hosted engine
+    python3 tokenmin.py --out report.md             # local engine → report
+    python3 tokenmin.py --submit-url URL --api-key K --out report.md   # hosted endpoint (future)
 
 Nothing leaves the machine unless you pass --submit-url. The anonymizer always
 runs before the snapshot is written or sent (unless --no-anonymize, which is
@@ -78,12 +76,13 @@ def _local_engine_structured():
 
 
 def _local_engine():
-    """Return the proprietary local engine if it's installed, else None.
+    """Return the local engine's `analyze` entry point if it's importable, else None.
 
-    The engine is a separate, proprietary package. When present it exposes
+    The engine ships at `engine/` in this repo (Apache-2.0). Auto-added to
+    sys.path at module load. When present it exposes
     `analyze(snapshot: dict) -> str` returning the Markdown report. Its absence
-    is normal — the open client is fully functional without it (it can still
-    produce and submit the anonymized snapshot).
+    is unusual and usually means a broken install — the scanner still functions
+    (it can produce + submit the anonymized snapshot) but won't render reports.
     """
     try:
         import tokenmin_engine  # type: ignore
@@ -430,7 +429,7 @@ def _update_cmd(args: list[str]) -> int:
 
     if not (root / ".git").is_dir():
         print(f"{c.YELLOW}!{c.RESET} {root} isn't a git checkout; can't update.", file=sys.stderr)
-        print(f"  reinstall via the F&F invite or public install URL to refresh.", file=sys.stderr)
+        print(f"  reinstall: curl --proto '=https' --tlsv1.2 -fsSL https://tokenmin.ai/install.sh | bash", file=sys.stderr)
         return 1
 
     # Force-refresh status (bypass cache).
@@ -588,9 +587,9 @@ def _doctor() -> int:
     engine_dir = root / "engine"
     engine_module = engine_dir / "tokenmin_engine.py"
     if engine_module.exists():
-        line("engine", f"{engine_module.name} (F&F bundle)")
+        line("engine", f"{engine_module.name}")
     else:
-        line("engine", "not bundled (public scanner only — no reports without --submit-url)", True)
+        line("engine", "not found (expected at engine/tokenmin_engine.py)", True)
 
     # Auto-update setting + actual update status (v0.12.5).
     au_mode = os.environ.get("TOKENMIN_AUTOUPDATE", "prompt")
@@ -985,10 +984,10 @@ def main(argv: list[str] | None = None) -> int:
         "No Tokenmin engine found on this install — you're running scanner-only mode.",
         "",
         "  next:  tokenmin --snapshot snap.json     # see exactly what would be sent",
-        "         tokenmin --submit-url HTTPS_URL   # hand off to a hosted engine",
+        "         tokenmin --submit-url HTTPS_URL   # hand off to a hosted endpoint (future; see ROADMAP.md)",
         "",
-        "The scanner holds no detection rules by design — see LICENSING.md.",
-        "For the full report, ask Rick for an F&F invite at https://tokenmin.ai",
+        "The engine lives at engine/ in this repo (Apache-2.0). A missing engine",
+        "usually means a broken install — try `tokenmin doctor` to diagnose.",
     ]
     print("\n".join(msg_lines), file=sys.stderr)
     return 0
@@ -1814,8 +1813,8 @@ def _demo() -> int:
     snapshot = scrub_value(snapshot)
     structured_engine = _local_engine_structured()
     if structured_engine is None:
-        print("tokenmin demo: no engine bundled — can't show a report.", file=sys.stderr)
-        print("  (you have the public scanner; for the engine, ask Rick for an F&F invite.)", file=sys.stderr)
+        print("tokenmin demo: engine not importable — can't show a report.", file=sys.stderr)
+        print("  (try `tokenmin doctor` to diagnose; the engine ships in this repo at engine/.)", file=sys.stderr)
         return 0
     result = structured_engine(snapshot)
     _render_terminal(result)

@@ -6,14 +6,13 @@ across their docs, engineering blog, and changelog. Tokenmin reads them so you
 don't have to, watches your actual usage, and shows you the next dollar you can
 save.
 
-This repo is the **public, Apache-2.0 audit copy** of Tokenmin — the code that
-decides what (if anything) leaves your machine when you run `tokenmin`. About
-5 minutes of reading, end to end.
+This repo is the **public, Apache-2.0 source** of Tokenmin — scanner, engine,
+and local server skeleton in one place. The code that decides what (if anything)
+leaves your machine is the code you can read. About 5 minutes end to end.
 
-The deal: Tokenmin is free during the friends-and-family preview in exchange for
-your anonymized usage data. The scanner that does the anonymization is open
-precisely so the trade is verifiable, not just promised. Read it. Diff it
-against your install. Then decide if you trust the bargain.
+Tokenmin runs entirely on your machine by default. Nothing is sent anywhere
+unless you opt in via `--submit-url` (and a hosted endpoint isn't live yet —
+see [`ROADMAP.md`](ROADMAP.md)).
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL https://tokenmin.ai/install.sh | bash
@@ -49,24 +48,24 @@ severity pills, per-finding next-action. Then `tokenmin show <id>` drills
 into one finding's evidence + fix. Then `tokenmin watch` runs a live
 dashboard while you work.
 
-## What's in here, what isn't
+## What's in here
 
 | Concern | Where |
 |---|---|
-| Walking `~/.claude` sessions, settings, agents, skills, MCP config | This repo — [`skills/tokenmin/analyzer.py`](skills/tokenmin/analyzer.py) |
-| Parsing claude.ai / Claude Desktop chat exports | This repo — [`skills/tokenmin/analyzer_chat_export.py`](skills/tokenmin/analyzer_chat_export.py) |
-| Anonymization (paths, secrets, labels, identifiers) | This repo — [`skills/tokenmin/anonymize.py`](skills/tokenmin/anonymize.py) |
-| Orchestrator CLI: collect → anonymize → submit → render | This repo — [`skills/tokenmin/tokenmin.py`](skills/tokenmin/tokenmin.py) |
-| Wrapper script + auto-update + version + doctor | This repo — [`tokenmin`](tokenmin) |
-| Tests + CI | This repo — [`tests/`](tests/), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
-| **Detection rules**, scoring, report rendering | Not here. Lives in proprietary `watsonrm/tokenmin-core`. |
-| Hosted submission server | Not here. Bundled in the F&F preview. |
+| Walking `~/.claude` sessions, settings, agents, skills, MCP config | [`skills/tokenmin/analyzer.py`](skills/tokenmin/analyzer.py) |
+| Parsing claude.ai / Claude Desktop chat exports | [`skills/tokenmin/analyzer_chat_export.py`](skills/tokenmin/analyzer_chat_export.py) |
+| Anonymization (paths, secrets, labels, identifiers) | [`skills/tokenmin/anonymize.py`](skills/tokenmin/anonymize.py) |
+| Orchestrator CLI: collect → anonymize → analyze → render | [`skills/tokenmin/tokenmin.py`](skills/tokenmin/tokenmin.py) |
+| Detection rule base | [`engine/patterns.py`](engine/patterns.py) |
+| Report rendering | [`engine/report.py`](engine/report.py) |
+| Pricing lookup | [`engine/pricing.py`](engine/pricing.py) + [`engine/pricing.json`](engine/pricing.json) |
+| Local HTTP server skeleton (for `--submit-url` testing) | [`server/tokenmin_server.py`](server/tokenmin_server.py) |
+| Wrapper script + auto-update + version + doctor | [`tokenmin`](tokenmin) |
+| Tests + CI | [`tests/`](tests/), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
-This repo is **scanner-only**. Running it produces an anonymized snapshot. It
-does *not* produce a report (that's the engine's job). The scanner is fully
-functional without the engine — you can write the snapshot to disk with
-`--snapshot snap.json` and audit what would be sent before deciding to submit
-anywhere.
+The default run produces a finished report locally. `--snapshot snap.json`
+writes the anonymized payload to disk if you want to audit what would be
+sent before opting into a future hosted endpoint.
 
 ## Install
 
@@ -153,8 +152,6 @@ Every push runs across Python 3.10 / 3.11 / 3.12:
 - Synthetic-leak gate: builds a fake `~/.claude/` with planted client names + paths,
   runs the scanner, fails CI if any plaintext survives the scrubber
 
-The F&F bundle mirrors these scanner files; its CI fails if they drift.
-
 ### Branch protection
 
 `main` is protected: no force-push, no branch deletion, linear history required.
@@ -192,32 +189,25 @@ set of sample inputs. No collection happens.
 
 ## Roadmap
 
-The F&F bargain ("free for anonymized data") only works if the install is
-trivial. That's the lead priority.
+See [`ROADMAP.md`](ROADMAP.md) for what's next. Highlights:
 
+- **Hosted analyze endpoint (Vercel)** — opt-in cloud endpoint with snapshot
+  persistence, so users can submit anonymized snapshots for shared-rule-base
+  analysis without anything more than a public-package install. Local engine
+  stays the default and the offline fallback.
 - **Native Claude Desktop adapter** — today Desktop users go through the
   chat-export path (same as web). Live Electron-store parsing is in progress.
-- **Hosted endpoint** — today the bundled `server/` stub runs locally for
-  testing. A real `https://api.tokenmin.ai/analyze` endpoint with persistence
-  + auth lands when F&F invitees cross ~5 yes-RSVPs.
-- **Engine v0.5 detectors** — cache hit ratio, mid-session `/model` cache flush,
-  output style presence, `ENABLE_TOOL_SEARCH` not set, subagent return-size
-  overruns, 1M-context trap past 256K. (See the public guide for the
-  underlying patterns.)
-- **GPG-signed releases** for `TOKENMIN_REQUIRE_SIGNED=1` users.
-- **One-line installer with embedded signature verification.**
+- **Rule-base community contributions** once enough usage data validates
+  which rules carry their weight.
 
 ## Repos
 
 | Repo | Visibility | Purpose |
 |---|---|---|
-| **`watsonrm/tokenmin-scanner`** (this) | public, Apache-2.0 | scanner + anonymizer + CLI |
-| `watsonrm/tokenmin` | private | F&F preview bundle (mirrors scanner files + ships engine + server) |
-| `watsonrm/tokenmin-core` | private | proprietary engine + rule base + positioning |
+| **`watsonrm/tokenmin-scanner`** (this) | public, Apache-2.0 | scanner + engine + server skeleton |
 | `watsonrm/tokenmin-site` | public | static site served at https://tokenmin.ai |
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The proprietary
-engine in `watsonrm/tokenmin-core` is under a separate, non-OSS license. See
-[`LICENSING.md`](LICENSING.md) for the boundary.
+Apache-2.0 across the whole repo. See [`LICENSE`](LICENSE), [`NOTICE`](NOTICE),
+and [`LICENSING.md`](LICENSING.md) for the layout.

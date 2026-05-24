@@ -3,12 +3,11 @@ name: tokenmin
 description: Analyze how the user uses Claude Code and recommend concrete improvements. Trigger when the user types bare "tokenmin" or "/tokenmin" inside Claude Code, or says "tokenmin me", "run tokenmin", "audit my claude usage", "how am I using claude code", "improve my claude setup", "what should I add to my claude config", or asks for a personalized claude code review. A bare "tokenmin" is a command — run it, don't ask what the user wants. Collects local sessions + config, anonymizes them, then hands the anonymized snapshot to the Tokenmin engine (local or hosted) for a ranked plan.
 ---
 
-# Tokenmin (open client)
+# Tokenmin
 
-You are running the Tokenmin open client. It collects the user's Claude Code usage,
-anonymizes it, and hands the anonymized snapshot to the Tokenmin engine. The client
-holds no detection rules — findings come from the Tokenmin engine (a local
-proprietary module if installed, otherwise the hosted service). See LICENSING.md.
+You are running Tokenmin. It collects the user's Claude Code usage,
+anonymizes it, and produces a ranked improvement plan. Scanner and engine
+both ship Apache-2.0 in this repo. See LICENSING.md.
 
 ## Steps
 
