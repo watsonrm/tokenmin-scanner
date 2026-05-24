@@ -62,19 +62,19 @@ class UpdateStatusContract(unittest.TestCase):
             self.assertIn("not a git repo", s["error"])
             self.assertIsNone(s["up_to_date"])
 
-    def test_caches_within_1h_when_not_forced(self):
-        # Pre-seed a cache file with a recent timestamp, confirm we return the
-        # cached value without re-fetching from origin. (Can't assert "no
-        # subprocess" because _version_info() itself shells out to git for
-        # local metadata; what matters is the *remote* check is skipped.)
+    def test_caches_within_1h_skips_ls_remote(self):
+        # Pre-seed a cache file with a recent timestamp; confirm we skip the
+        # network call (the *latest_* fields come from cache; current_* always
+        # comes fresh from _version_info — that's the v0.12.5 fix for "cache
+        # reports stale 'behind' after an update").
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".git").mkdir()
             (root / ".update-status").write_text(json.dumps({
                 "current_version": "9.9.9",
-                "current_sha": "abc1234",
+                "current_sha": "abc1234abcd",
                 "latest_version": "9.9.9",
-                "latest_sha": "abc1234",
+                "latest_sha": "abc1234abcd",
                 "up_to_date": True,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
                 "error": "",
@@ -87,12 +87,61 @@ class UpdateStatusContract(unittest.TestCase):
                 return real_run(cmd, *a, **kw)
             with unittest.mock.patch.object(tokenmin, "_install_dir",
                                             return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "9.9.9", "commit": "abc1234abcd"}), \
                  unittest.mock.patch("subprocess.run", side_effect=watching_run):
                 s = tokenmin._update_status(force_refresh=False)
             self.assertEqual(s["current_version"], "9.9.9")
             self.assertTrue(s["up_to_date"])
             self.assertEqual(ls_remote_called, [],
                              "cache hit must skip the network ls-remote call")
+
+    def test_sha_comparison_uses_prefix(self):
+        # Regression for the v0.12.5 dogfood bug: _version_info() returns a
+        # 12-char short SHA; `git ls-remote` returns 40-char full. Without
+        # prefix compare, up_to_date is always False — update happily "pulls"
+        # the same commit and --version reports "behind" forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / "VERSION").write_text("0.12.5\n")
+            short_sha = "0e2c15c32b26"
+            full_sha  = "0e2c15c32b26abcdef0123456789012345678901"
+            def fake_run(cmd, *a, **kw):
+                if "ls-remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, f"{full_sha}\trefs/heads/main\n", "")
+                if "show" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "0.12.5\n", "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "0.12.5", "commit": short_sha}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                s = tokenmin._update_status(force_refresh=True)
+            self.assertTrue(s["up_to_date"],
+                            f"SHA prefix compare broke: current={s['current_sha']!r} latest={s['latest_sha']!r}")
+
+    def test_cache_recomputes_up_to_date_after_local_update(self):
+        # Pre-seed a cache that says "behind" (current=oldsha, latest=newsha),
+        # then re-read with current bumped to newsha (simulating an update).
+        # The returned status must NOT report "behind" anymore — the cache
+        # should refresh current_* and recompute up_to_date.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / ".update-status").write_text(json.dumps({
+                "current_version": "0.12.4", "current_sha": "oldsha000000",
+                "latest_version": "0.12.5", "latest_sha": "newsha000000ffffffff",
+                "up_to_date": False,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "error": "",
+            }))
+            with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "0.12.5", "commit": "newsha000000"}):
+                s = tokenmin._update_status(force_refresh=False)
+            self.assertTrue(s["up_to_date"], "cache failed to refresh current_sha after a local update")
+            self.assertEqual(s["current_version"], "0.12.5")
 
     def test_force_refresh_bypasses_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

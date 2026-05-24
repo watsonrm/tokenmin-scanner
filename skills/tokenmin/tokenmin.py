@@ -294,9 +294,19 @@ def _update_status(force_refresh: bool = False, timeout_sec: int = 3) -> dict:
     cache = root / ".update-status"
     info = _version_info()
     current_version = info.get("version", "dev")
-    current_sha = info.get("commit", "")
+    current_sha = info.get("commit", "")  # truncated to 12 chars by _version_info
 
-    # Cache check — short-circuit when not forced and within 1h.
+    def _shas_equal(a: str, b: str) -> bool:
+        # `_version_info` returns 12-char short SHA; `git ls-remote` returns
+        # the 40-char full SHA. Prefix-compare so they agree.
+        if not a or not b:
+            return False
+        n = min(len(a), len(b))
+        return a[:n] == b[:n]
+
+    # Cache check — short-circuit when not forced and within 1h. Refresh the
+    # `current_*` fields from disk on every read so an update doesn't leave
+    # the cache reporting stale "you're behind" forever.
     if not force_refresh and cache.is_file():
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -304,6 +314,9 @@ def _update_status(force_refresh: bool = False, timeout_sec: int = 3) -> dict:
             if ts:
                 age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
                 if age < 3600:
+                    cached["current_version"] = current_version
+                    cached["current_sha"] = current_sha
+                    cached["up_to_date"] = _shas_equal(cached.get("latest_sha") or "", current_sha)
                     return cached
         except (OSError, json.JSONDecodeError, ValueError):
             pass
@@ -336,7 +349,7 @@ def _update_status(force_refresh: bool = False, timeout_sec: int = 3) -> dict:
         return result
 
     result["latest_sha"] = remote_sha
-    result["up_to_date"] = (remote_sha == current_sha) if current_sha else None
+    result["up_to_date"] = _shas_equal(remote_sha, current_sha)
 
     # Fetch the VERSION file from the remote ref (without merging). Use
     # cat-file with --no-pager-style direct read.
