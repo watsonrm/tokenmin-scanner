@@ -25,23 +25,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Confirm scanner files are bit-identical to public watsonrm/tokenmin-scanner
-        # Only run for the F&F bundle repo (which mirrors the public scanner).
-        # On the public scanner itself this is a no-op (it IS the canonical copy).
-        if: github.repository == 'watsonrm/tokenmin'
-        run: |
-          set -euo pipefail
-          git clone --depth 1 https://github.com/watsonrm/tokenmin-scanner.git /tmp/tms-pub
-          if diff -r --exclude=__pycache__ --exclude=.last-update-check \
-                  --exclude=.salt --exclude=audit.log \
-                  skills/tokenmin/ /tmp/tms-pub/skills/tokenmin/; then
-            echo "✓ scanner files mirror watsonrm/tokenmin-scanner exactly"
-          else
-            echo "✗ scanner files have drifted from watsonrm/tokenmin-scanner"
-            echo "  re-sync before merging"
-            exit 1
-          fi
-
       - name: Run scrubber + CLI tests
         run: bash tests/run.sh
 

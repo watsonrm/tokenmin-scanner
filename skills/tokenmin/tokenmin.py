@@ -803,8 +803,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.submit_url:
         _check_submit_url(args.submit_url)
 
-    # First-run telemetry consent (no-op when already decided, or non-interactive,
-    # or F&F-pre-configured). Never asks for runs that won't produce findings.
+    # First-run telemetry consent (no-op when already decided, or non-interactive).
+    # Never asks for runs that won't produce findings.
     _maybe_telemetry_consent()
     # First-run billing plan consent — lets the report frame savings as quota
     # stretch instead of dollar savings for flat-fee Pro/Max users.
@@ -2020,8 +2020,7 @@ def _selftest() -> int:
 # SECURITY.md.
 #
 # Posture:
-#   - F&F invitees:    default ON (the per-invite installer sets it at install)
-#   - Public scanner:  default OFF, first-run consent flow asks once
+#   - Default OFF; first-run consent flow asks once on an interactive run
 #   - TOKENMIN_NO_TELEMETRY=1 always wins, regardless of settings
 #   - `tokenmin telemetry off` disables permanently
 #   - `tokenmin telemetry dry-run` prints what would be sent without sending
@@ -2240,7 +2239,8 @@ def _send_telemetry(event: dict) -> None:
          API commit. `telemetry_github_token` carries the PAT (contents:write
          on the target repo). Each event becomes a file at
          `events/YYYY-MM-DD/<timestamp>-<install_id_prefix>.json` via a
-         single PUT call. This is the F&F-window setup.
+         single PUT call. This was the early-preview setup; the hosted-endpoint
+         mode (option 1 above) is the path forward once the Vercel function ships.
 
     Either way the JSON shape is identical, so migration between modes is
     a single field change in settings.json.
@@ -2300,9 +2300,8 @@ def _send_telemetry(event: dict) -> None:
 
 
 def _maybe_telemetry_consent() -> None:
-    """First-run consent ask for public-scanner installs. F&F invitees have
-    `telemetry: on` pre-set by the installer and skip this. Public users see
-    this on their first interactive `tokenmin` invocation."""
+    """First-run consent ask. Users see this once on their first interactive
+    `tokenmin` invocation; subsequent runs respect whatever they chose."""
     s = _load_settings()
     if s.get("telemetry") in ("on", "off"):
         return  # already decided

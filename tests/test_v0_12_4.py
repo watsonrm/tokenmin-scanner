@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""v0.12.4 behavior tests — four CLI/engine guarantees from the F&F dogfood:
+"""v0.12.4 behavior tests — four CLI/engine guarantees surfaced during preview testing:
 
   Scanner #4: low-impact findings filter
     Engine tags each finding `low_impact: true|false` per plan threshold.
