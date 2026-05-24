@@ -820,11 +820,16 @@ def _fmt_money(x: float) -> str:
 
 
 def _severity(savings: float) -> tuple[str, str, str]:
-    """Returns (pill_text, color_code_attr, label) for a finding's $/mo."""
-    if savings >= 500: return ("$$$$", "RED", "critical")
-    if savings >= 100: return ("$$$", "YELLOW", "high")
-    if savings >= 25:  return ("$$",  "CYAN", "medium")
-    return ("$",  "GRAY", "low")
+    """Returns (pill_text, color_code_attr, label) for a finding's $/mo.
+
+    Pills are stars (★) — not dollar signs — so the visual tier reads as
+    severity, not money. Pro/Max users were getting confused by `$$$$` because
+    it looks like a price even though it's just "highest tier" (scanner#5).
+    """
+    if savings >= 500: return ("★★★★", "RED", "critical")
+    if savings >= 100: return ("★★★ ", "YELLOW", "high")
+    if savings >= 25:  return ("★★  ", "CYAN", "medium")
+    return ("★   ", "GRAY", "low")
 
 
 def _bar(ratio: float, width: int = 10) -> str:
@@ -933,7 +938,20 @@ def _render_terminal(result: dict) -> None:
         _print_next_steps(c, [])
         return
 
-    # Headline — plan-aware.
+    # v0.12.4 (scanner#4): split into primary (worth surfacing) and low-impact
+    # (drop to a one-line footer + `tokenmin show low-impact`). The engine
+    # already tagged each finding with low_impact = True/False per plan.
+    primary = [f for f in findings if not f.get("low_impact", False)]
+    low_impact = [f for f in findings if f.get("low_impact", False)]
+
+    # If filtering would leave nothing, keep the highest finding so the user
+    # still sees SOMETHING actionable.
+    if not primary and findings:
+        primary = [findings[0]]
+        low_impact = findings[1:]
+
+    # Headline — plan-aware. Counts include both buckets so the user knows
+    # the engine isn't broken when 7 findings collapse to 3 in the display.
     if subscription:
         total_unit = _fmt_quota_pct(total_save, monthly_api)
         print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  {c.BOLD}{total_unit}{c.RESET} stretch across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
@@ -941,9 +959,9 @@ def _render_terminal(result: dict) -> None:
         print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(total_save)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
     print()
 
-    max_save = max((f["savings_usd_per_month"] for f in findings), default=1.0) or 1.0
+    max_save = max((f["savings_usd_per_month"] for f in primary), default=1.0) or 1.0
 
-    for i, f in enumerate(findings, 1):
+    for i, f in enumerate(primary, 1):
         save = f["savings_usd_per_month"]
         pill, color_attr, _ = _severity(save)
         pill_color = getattr(c, color_attr)
@@ -952,8 +970,7 @@ def _render_terminal(result: dict) -> None:
         conf = int(f.get("confidence", 0) * 100)
         hrs = f.get("hours_to_implement", 0.0)
 
-        # Strip control chars from anything that came from the engine — defense
-        # against ANSI injection through finding titles/evidence/ids.
+        # Strip control chars — ANSI injection defense via finding titles.
         title = _strip_ctl(f["title"])
         evidence = _strip_ctl(f.get("evidence", ""))
         finding_id = _strip_ctl(f["id"])
@@ -964,12 +981,17 @@ def _render_terminal(result: dict) -> None:
             save_unit = f"{_fmt_money(save)}/mo"
 
         print(f"  {c.BOLD}{i}.{c.RESET} {c.BOLD}{title}{c.RESET}")
-        print(f"     {pill_color}{pill:<5}{c.RESET}  {_bar(rel)}  {c.BOLD}{save_unit}{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
+        print(f"     {pill_color}{pill}{c.RESET}  {_bar(rel)}  {c.BOLD}{save_unit}{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
         print(f"     {c.DIM}evidence:{c.RESET} {evidence}")
         print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {finding_id}{c.RESET}")
         print()
 
-    _print_next_steps(c, findings)
+    if low_impact:
+        print(f"  {c.DIM}+ {len(low_impact)} low-impact finding(s) hidden — "
+              f"{c.RESET}{c.CYAN}tokenmin show low-impact{c.RESET}{c.DIM} to see{c.RESET}")
+        print()
+
+    _print_next_steps(c, primary)
 
 
 def _print_next_steps(c: "_C", findings: list) -> None:
@@ -984,7 +1006,15 @@ def _print_next_steps(c: "_C", findings: list) -> None:
 
 
 def _render_show(finding_id: str) -> int:
-    """Drill-down into one finding. Reads last_run.json."""
+    """Drill-down into one finding. Reads last_run.json.
+
+    Special id `low-impact` lists all findings the engine flagged as below
+    the per-plan impact threshold (rec from scanner#4 — those don't pollute
+    the main audit but the user can still inspect them on demand).
+
+    Plan-aware: subscription users see `~Y% quota` instead of `$X/mo`
+    (scanner#5 — show was leaking dollars even after v0.12.3).
+    """
     c = _C(_ansi_supported())
     last = _load_last_run()
     if not last:
@@ -992,13 +1022,38 @@ def _render_show(finding_id: str) -> int:
         print("  run `tokenmin` first to produce findings, then `tokenmin show <id>`.", file=sys.stderr)
         return 2
     findings = last.get("findings") or []
+    plan = last.get("billing_plan", "unknown")
+    snap_info = last.get("snapshot") or {}
+    monthly_api = snap_info.get("monthly_api_equivalent_cost_usd", 0.0)
+    subscription = plan in ("pro", "max")
+
+    # Special: list all low-impact findings.
+    if finding_id == "low-impact":
+        low = [f for f in findings if f.get("low_impact", False)]
+        if not low:
+            print(f"  {c.GREEN}✓{c.RESET} no low-impact findings in the last run", file=sys.stderr)
+            return 0
+        print(file=sys.stderr)
+        print(f"  {c.BOLD}{c.MAGENTA}Low-impact findings{c.RESET} ({len(low)})", file=sys.stderr)
+        print(f"  {c.DIM}hidden from the main audit because each is below the per-plan threshold.{c.RESET}", file=sys.stderr)
+        print(file=sys.stderr)
+        for f in low:
+            save = f["savings_usd_per_month"]
+            unit = _fmt_quota_pct(save, monthly_api) if subscription else f"{_fmt_money(save)}/mo"
+            print(f"  - {c.BOLD}{_strip_ctl(f['id'])}{c.RESET}  {c.DIM}{unit} · {_strip_ctl(f['title'])}{c.RESET}", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"  drill into one: {c.CYAN}tokenmin show <id>{c.RESET}", file=sys.stderr)
+        return 0
+
     found = next((f for f in findings if f["id"] == finding_id), None)
     if not found:
         print(f"tokenmin show: no finding with id '{finding_id}' in last run.", file=sys.stderr)
         if findings:
             print("  available findings:", file=sys.stderr)
             for f in findings:
-                print(f"    {f['id']}", file=sys.stderr)
+                tag = " (low-impact)" if f.get("low_impact") else ""
+                print(f"    {f['id']}{tag}", file=sys.stderr)
+            print(f"    low-impact  (list all hidden findings)", file=sys.stderr)
         return 2
 
     save = found["savings_usd_per_month"]
@@ -1013,14 +1068,20 @@ def _render_show(finding_id: str) -> int:
     evidence = _strip_ctl(found.get("evidence", ""))
     how_to_fix = _strip_ctl(found.get("how_to_fix", "") or "")
 
+    # Plan-aware impact line — no dollar leak for Pro/Max.
+    if subscription:
+        impact_line = f"{c.BOLD}{_fmt_quota_pct(save, monthly_api)}{c.RESET} stretch on your flat-fee plan"
+    else:
+        impact_line = f"{c.BOLD}{_fmt_money(save)}/mo{c.RESET} estimated savings (at API rates)"
+
     print()
     print(f"  {c.BOLD}{c.MAGENTA}{title}{c.RESET}")
     print(f"  {c.GRAY}finding id: {fid}{c.RESET}")
     print()
-    print(f"  Severity  {pill_color}{pill}{c.RESET} ({label})")
-    print(f"  Impact    {c.BOLD}{_fmt_money(save)}/mo{c.RESET} estimated savings")
-    print(f"  Effort    {hrs:.1f} hrs to implement")
-    print(f"  Pillar    {pillar}")
+    print(f"  Severity   {pill_color}{pill}{c.RESET} ({label})")
+    print(f"  Impact     {impact_line}")
+    print(f"  Effort     {hrs:.1f} hrs to implement")
+    print(f"  Pillar     {pillar}")
     print(f"  Confidence {conf}%")
     print()
     print(f"  {c.BOLD}Evidence{c.RESET}")

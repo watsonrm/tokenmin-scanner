@@ -90,6 +90,15 @@ class ConfigSnapshot:
     projects_total: int = 0
     projects_with_local_settings: int = 0
     projects_with_local_agents: int = 0
+    # v0.12.4: walk each project's session JSONL `cwd` field to find the real
+    # source-repo path, then probe THAT path for project-level CLAUDE.md and
+    # .claude/agents/. Without this, the engine fires no_global_claude_md /
+    # no_custom_agents as 95%-confidence findings on users whose entire setup
+    # lives at the project level — scanner issue #7.
+    project_cwd_total: int = 0
+    project_cwd_with_claude_md: int = 0
+    project_cwd_with_local_agents: int = 0
+    project_cwd_with_agent_count: int = 0  # sum of agents across those .claude/agents/ dirs
     # Output-style configuration. v0.5: surface absence of `outputStyle` so the
     # engine can recommend the one-line config change Anthropic measures at
     # 40–65% output-token reduction.
@@ -310,6 +319,41 @@ def _safe_json(path: Path) -> dict | list | None:
         return None
 
 
+def _first_cwd_in_project(proj_dir: Path) -> str | None:
+    """Read the first JSONL session in a project dir and return its `cwd` field.
+
+    Claude Code mangles source-repo paths into project dir names by replacing
+    `/` and ` ` with `-`, which is lossy (you can't reliably reverse it). But
+    every session JSONL records the real CWD in its first message — using
+    that is authoritative.
+
+    Returns None if no JSONL is readable. Tries up to 3 files to survive
+    occasional corrupted-first-line cases.
+    """
+    try:
+        jsonls = sorted(p for p in proj_dir.iterdir()
+                        if p.is_file() and p.suffix == ".jsonl")
+    except OSError:
+        return None
+    for jsonl in jsonls[:3]:
+        try:
+            with jsonl.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    cwd = ev.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        return cwd
+        except OSError:
+            continue
+    return None
+
+
 def scan_config(claude_home: Path) -> ConfigSnapshot:
     snap = ConfigSnapshot()
     settings = claude_home / "settings.json"
@@ -382,13 +426,15 @@ def scan_config(claude_home: Path) -> ConfigSnapshot:
     # projects
     projects_dir = claude_home / "projects"
     if projects_dir.is_dir():
+        # Track seen CWDs so a project with many session JSONLs only counts
+        # once. cwd comes from the first message in each session.
+        seen_cwds: set[str] = set()
         for proj in projects_dir.iterdir():
             if not proj.is_dir():
                 continue
             snap.projects_total += 1
-            # Claude Code mangles project paths into dir names; the real project
-            # path is encoded in the dir name. We can't reliably stat the source
-            # repo, but we can look for sidecar files dropped in the project dir.
+            # Sidecar files dropped in ~/.claude/projects/<encoded>/ — rare but
+            # supported (kept for back-compat with the v0.12.3 schema).
             proj_md = proj / "CLAUDE.md"
             if proj_md.exists():
                 snap.projects_with_claude_md += 1
@@ -401,6 +447,28 @@ def scan_config(claude_home: Path) -> ConfigSnapshot:
                 snap.projects_with_local_settings += 1
             if (proj / "agents").is_dir():
                 snap.projects_with_local_agents += 1
+
+            # v0.12.4: dig real CWDs from session JSONLs and check the source
+            # repos directly. This is the load-bearing change for issue #7.
+            cwd = _first_cwd_in_project(proj)
+            if cwd is None or cwd in seen_cwds:
+                continue
+            seen_cwds.add(cwd)
+            cwd_path = Path(cwd)
+            if not cwd_path.is_dir():
+                continue
+            snap.project_cwd_total += 1
+            if (cwd_path / "CLAUDE.md").is_file():
+                snap.project_cwd_with_claude_md += 1
+            agents_dir = cwd_path / ".claude" / "agents"
+            if agents_dir.is_dir():
+                snap.project_cwd_with_local_agents += 1
+                try:
+                    snap.project_cwd_with_agent_count += sum(
+                        1 for p in agents_dir.iterdir() if p.is_file() and p.suffix == ".md"
+                    )
+                except OSError:
+                    pass
 
     return snap
 
