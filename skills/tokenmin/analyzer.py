@@ -17,23 +17,33 @@ from typing import Any
 
 
 # --- pricing ----------------------------------------------------------------
-# Rough USD per million tokens. Update as needed.
-PRICING: dict[str, tuple[float, float, float, float]] = {
-    # model_substring: (input, output, cache_write, cache_read)
-    "opus":   (15.00, 75.00, 18.75, 1.50),
-    "sonnet": ( 3.00, 15.00,  3.75, 0.30),
-    "haiku":  ( 0.80,  4.00,  1.00, 0.08),
-}
-
-
-def _price_for(model: str | None) -> tuple[float, float, float, float]:
-    if not model:
-        return PRICING["sonnet"]
-    m = model.lower()
-    for key, prices in PRICING.items():
-        if key in m:
-            return prices
-    return PRICING["sonnet"]
+# Pricing tables now live in engine/pricing.json so a single edit + auto-update
+# refreshes every install when Anthropic changes rates. See engine/pricing.py
+# for the loader + staleness check.
+import sys as _sys
+from pathlib import Path as _Path
+_engine_dir = _Path(__file__).resolve().parent.parent.parent / "engine"
+if str(_engine_dir) not in _sys.path:
+    _sys.path.insert(0, str(_engine_dir))
+try:
+    from pricing import price_for as _price_for  # type: ignore
+except ImportError:
+    # Engine not bundled (scanner-only install) — fall back to static rates.
+    # These match the bundled pricing.json defaults; if they ever drift, the
+    # scanner-only path silently uses these instead.
+    _STATIC_PRICING = {
+        "opus":   (15.00, 75.00, 18.75, 1.50),
+        "sonnet": ( 3.00, 15.00,  3.75, 0.30),
+        "haiku":  ( 0.80,  4.00,  1.00, 0.08),
+    }
+    def _price_for(model):
+        if not model:
+            return _STATIC_PRICING["sonnet"]
+        ml = model.lower()
+        for key, prices in _STATIC_PRICING.items():
+            if key in ml:
+                return prices
+        return _STATIC_PRICING["sonnet"]
 
 
 # --- data classes -----------------------------------------------------------

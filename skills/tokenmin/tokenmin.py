@@ -419,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
         return _help_export()
     if argv and argv[0] == "telemetry":
         return _telemetry_cmd(argv[1:])
+    if argv and argv[0] == "plan":
+        return _plan_cmd(argv[1:])
 
     p = argparse.ArgumentParser(
         prog="tokenmin",
@@ -567,6 +569,12 @@ def main(argv: list[str] | None = None) -> int:
     # First-run telemetry consent (no-op when already decided, or non-interactive,
     # or F&F-pre-configured). Never asks for runs that won't produce findings.
     _maybe_telemetry_consent()
+    # First-run billing plan consent — lets the report frame savings as quota
+    # stretch instead of dollar savings for flat-fee Pro/Max users.
+    _maybe_billing_plan_consent()
+    # If pricing.json is older than its stale threshold, warn ONCE so users
+    # know dollar numbers may not match Anthropic's current published rates.
+    _maybe_stale_pricing_warning()
 
     # Resolve --days. Accept "auto" (default) or an integer string. For code
     # source, peek at session count to auto-scale the window.
@@ -673,7 +681,13 @@ def main(argv: list[str] | None = None) -> int:
     structured_engine = _local_engine_structured()
     if structured_engine is not None:
         _progress("analyzing", done=False)
-        result = structured_engine(snapshot)
+        # Pass the billing plan so the report frames savings in the right unit
+        # (dollar savings on API; % quota stretch on flat-fee Pro/Max).
+        try:
+            result = structured_engine(snapshot, billing_plan=_billing_plan())
+        except TypeError:
+            # Pre-0.5 engine without billing_plan kwarg.
+            result = structured_engine(snapshot)
         _progress("analyzed", done=True)
         _save_last_run(result)
 
@@ -851,24 +865,38 @@ _ANCHORS: dict[str, str] = {
 }
 
 
+def _fmt_quota_pct(savings_usd: float, monthly_api: float) -> str:
+    """Pro/Max framing: render savings as % of API-equivalent monthly cost."""
+    if monthly_api <= 0:
+        return "~? quota"
+    pct = min(95.0, 100.0 * savings_usd / monthly_api)
+    return f"~{pct:.0f}% quota"
+
+
 def _render_terminal(result: dict) -> None:
-    """Print the inline headline card + ranked findings card. The 'magic moment'."""
+    """Print the inline headline card + ranked findings card. The 'magic moment'.
+
+    Plan-aware: dollar framing for API/unknown users, quota-stretch % for
+    Pro/Max (rec E from the cost-framing redesign — flat-fee users don't have
+    a $-denominated bill to reduce, so $/mo is misleading on those plans).
+    """
     c = _C(_ansi_supported())
     snap = result.get("snapshot", {})
     findings = result.get("findings") or []
     total_save = result.get("total_savings_usd_per_month", 0.0)
     total_eff = result.get("total_hours_to_implement", 0.0)
     cost = snap.get("total_cost_usd", 0.0)
+    monthly_api = snap.get("monthly_api_equivalent_cost_usd", 0.0)
     sessions = snap.get("sessions", 0)
     days = snap.get("window_days", 0)
     models = snap.get("models") or []
     models_line = "  ·  ".join(f"{m['name']} {round(m['share']*100)}%" for m in models[:3]) or "no model data"
+    plan = result.get("billing_plan", "unknown")
+    subscription = plan in ("pro", "max")
 
     line = "─" * 72
 
     # Detect export-mode: ConfigSnapshot is at defaults (no global settings).
-    # When this is true, we can't see /clear discipline, MCP setup, hooks, etc.
-    # Set honest expectations rather than under-deliver silently.
     cfg = snap.get("config") or {}
     is_export_mode = (
         not cfg.get("has_global_claude_md")
@@ -882,7 +910,14 @@ def _render_terminal(result: dict) -> None:
     print(f"  {c.BOLD}{c.MAGENTA}Tokenmin{c.RESET}  Claude usage audit")
     print(f"  {c.GRAY}{line}{c.RESET}")
     print(f"  scanned {c.BOLD}{sessions}{c.RESET} sessions over {days} days")
-    print(f"  est. spend (window): {c.BOLD}{_fmt_money(cost)}{c.RESET}")
+    if subscription:
+        # Don't show a dollar number — Pro/Max users pay flat. Show plan instead.
+        print(f"  plan: {c.BOLD}{plan}{c.RESET} {c.DIM}(flat-fee; savings reported as quota stretch){c.RESET}")
+    else:
+        plan_tag = f" {c.DIM}(plan: {plan}){c.RESET}" if plan != "unknown" else (
+            f" {c.DIM}— set with `tokenmin plan api|pro|max`{c.RESET}"
+        )
+        print(f"  API-equivalent cost (window): {c.BOLD}{_fmt_money(cost)}{c.RESET}{plan_tag}")
     print(f"  model mix: {c.DIM}{models_line}{c.RESET}")
     if is_export_mode:
         print(f"  {c.YELLOW}note:{c.RESET} {c.DIM}export-mode analysis. The export doesn't carry token counts,{c.RESET}")
@@ -898,8 +933,12 @@ def _render_terminal(result: dict) -> None:
         _print_next_steps(c, [])
         return
 
-    # Headline.
-    print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(total_save)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
+    # Headline — plan-aware.
+    if subscription:
+        total_unit = _fmt_quota_pct(total_save, monthly_api)
+        print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  {c.BOLD}{total_unit}{c.RESET} stretch across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
+    else:
+        print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(total_save)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
     print()
 
     max_save = max((f["savings_usd_per_month"] for f in findings), default=1.0) or 1.0
@@ -914,14 +953,18 @@ def _render_terminal(result: dict) -> None:
         hrs = f.get("hours_to_implement", 0.0)
 
         # Strip control chars from anything that came from the engine — defense
-        # against ANSI injection through finding titles/evidence/ids if an
-        # adversary planted them in source data.
+        # against ANSI injection through finding titles/evidence/ids.
         title = _strip_ctl(f["title"])
         evidence = _strip_ctl(f.get("evidence", ""))
         finding_id = _strip_ctl(f["id"])
 
+        if subscription:
+            save_unit = _fmt_quota_pct(save, monthly_api)
+        else:
+            save_unit = f"{_fmt_money(save)}/mo"
+
         print(f"  {c.BOLD}{i}.{c.RESET} {c.BOLD}{title}{c.RESET}")
-        print(f"     {pill_color}{pill:<5}{c.RESET}  {_bar(rel)}  {c.BOLD}{_fmt_money(save)}/mo{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
+        print(f"     {pill_color}{pill:<5}{c.RESET}  {_bar(rel)}  {c.BOLD}{save_unit}{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
         print(f"     {c.DIM}evidence:{c.RESET} {evidence}")
         print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {finding_id}{c.RESET}")
         print()
@@ -1117,22 +1160,29 @@ def _auto_days(claude_home: Path, requested: str | int) -> int:
 
 # --- tokenmin watch (live dashboard) ---------------------------------------
 
-# Pricing per million tokens, by model family. (input, output, cache_write, cache_read)
-_WATCH_PRICING = {
-    "opus":   (15.00, 75.00, 18.75, 1.50),
-    "sonnet": ( 3.00, 15.00,  3.75, 0.30),
-    "haiku":  ( 0.80,  4.00,  1.00, 0.08),
-}
-
-
-def _watch_price(model: str | None) -> tuple[float, float, float, float]:
-    if not model:
-        return _WATCH_PRICING["sonnet"]
-    m = model.lower()
-    for key, prices in _WATCH_PRICING.items():
-        if key in m:
-            return prices
-    return _WATCH_PRICING["sonnet"]
+# Pricing now lives in engine/pricing.json — see engine/pricing.py for the
+# loader. Keeping a single _watch_price wrapper so the call sites elsewhere in
+# this file don't need to know whether the engine is bundled.
+_engine_dir = Path(__file__).resolve().parent.parent.parent / "engine"
+if str(_engine_dir) not in sys.path:
+    sys.path.insert(0, str(_engine_dir))
+try:
+    from pricing import price_for as _watch_price  # type: ignore
+except ImportError:
+    # Scanner-only install (no engine) — fall back to last-known rates.
+    _WATCH_PRICING_FALLBACK = {
+        "opus":   (15.00, 75.00, 18.75, 1.50),
+        "sonnet": ( 3.00, 15.00,  3.75, 0.30),
+        "haiku":  ( 0.80,  4.00,  1.00, 0.08),
+    }
+    def _watch_price(model):
+        if not model:
+            return _WATCH_PRICING_FALLBACK["sonnet"]
+        m = model.lower()
+        for key, prices in _WATCH_PRICING_FALLBACK.items():
+            if key in m:
+                return prices
+        return _WATCH_PRICING_FALLBACK["sonnet"]
 
 
 def _active_sessions(claude_home: Path, max_age_sec: float) -> list[Path]:
@@ -2063,6 +2113,123 @@ def _telemetry_cmd(args: list[str]) -> int:
         print(json.dumps(event, indent=2, sort_keys=True))
         return 0
     return 2
+
+
+_VALID_PLANS = ("api", "pro", "max", "unknown")
+
+
+def _billing_plan() -> str:
+    """Current billing plan from settings.json. Defaults to 'unknown'."""
+    s = _load_settings()
+    plan = s.get("billing_plan", "unknown")
+    return plan if plan in _VALID_PLANS else "unknown"
+
+
+def _maybe_billing_plan_consent() -> None:
+    """First interactive run asks how the user pays for Claude.
+
+    Without this, tokenmin reports 'Est. cost $X' which is the API-equivalent
+    cost — accurate at retail rates, but misleading on Pro/Max where the user
+    actually pays a flat fee. Knowing the plan lets us frame savings in the
+    right unit (dollars on API; % quota stretch on Pro/Max).
+
+    Skips:
+      - already set (any value in _VALID_PLANS other than 'unknown')
+      - non-interactive (no tty) — leaves 'unknown' for a later run
+      - explicit decline ('skip') — sets 'unknown' + a marker so we don't nag
+    """
+    s = _load_settings()
+    if s.get("billing_plan") in ("api", "pro", "max"):
+        return
+    if s.get("billing_plan_asked"):
+        return
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return
+    c = _C(_ansi_supported())
+    print(f"\n  {c.BOLD}One quick question:{c.RESET} how do you pay for Claude?", file=sys.stderr)
+    print(f"  {c.DIM}Tokenmin reports cost at API rates. On Claude Pro/Max (flat fee) those{c.RESET}", file=sys.stderr)
+    print(f"  {c.DIM}numbers don't match your bill — knowing your plan lets us reframe them{c.RESET}", file=sys.stderr)
+    print(f"  {c.DIM}as 'quota stretch' instead of dollar savings.{c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"    {c.CYAN}a{c.RESET}) Anthropic API (metered, pay per token)", file=sys.stderr)
+    print(f"    {c.CYAN}p{c.RESET}) Claude Pro (~$20/mo flat)", file=sys.stderr)
+    print(f"    {c.CYAN}m{c.RESET}) Claude Max (~$100-$200/mo flat)", file=sys.stderr)
+    print(f"    {c.CYAN}s{c.RESET}) skip — leave as 'unknown' (you can set it later with `tokenmin plan <choice>`)", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  Choose [a/p/m/s] ", end="", file=sys.stderr)
+    sys.stderr.flush()
+    try:
+        ans = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    plan_map = {"a": "api", "api": "api", "p": "pro", "pro": "pro", "m": "max", "max": "max"}
+    s["billing_plan"] = plan_map.get(ans, "unknown")
+    s["billing_plan_asked"] = True
+    _save_settings(s)
+    if s["billing_plan"] == "unknown":
+        print(f"  {c.DIM}set to 'unknown'. Set later with `tokenmin plan api|pro|max`.{c.RESET}", file=sys.stderr)
+    else:
+        print(f"  {c.GREEN}✓{c.RESET} billing plan set to {c.BOLD}{s['billing_plan']}{c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
+def _maybe_stale_pricing_warning() -> None:
+    """Warn when bundled pricing.json is older than its own stale threshold.
+
+    Fires at most once per day (tracked in settings) so noisy runs don't repeat
+    the warning. Quiet for subscription users (they don't see dollars anyway).
+    """
+    s = _load_settings()
+    plan = s.get("billing_plan", "unknown")
+    if plan in ("pro", "max"):
+        return
+    if not (sys.stderr.isatty()):
+        return
+    try:
+        from pricing import is_stale, pricing_age_days, pricing_metadata  # type: ignore
+    except ImportError:
+        return
+    if not is_stale():
+        return
+    last_warn = s.get("stale_pricing_last_warn", "")
+    today = datetime.now(timezone.utc).date().isoformat()
+    if last_warn == today:
+        return
+    age = pricing_age_days() or 0
+    meta = pricing_metadata()
+    c = _C(_ansi_supported())
+    print(file=sys.stderr)
+    print(f"  {c.YELLOW}note:{c.RESET} bundled pricing data is {c.BOLD}{age} days{c.RESET} old "
+          f"(updated {meta.get('last_updated', '?')}).", file=sys.stderr)
+    print(f"  {c.DIM}Dollar numbers may not match Anthropic's current rates.{c.RESET}", file=sys.stderr)
+    print(f"  {c.DIM}Run `tokenmin --update` to pull the latest, or check {meta.get('source', 'anthropic.com/pricing')}.{c.RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+    s["stale_pricing_last_warn"] = today
+    _save_settings(s)
+
+
+def _plan_cmd(args: list[str]) -> int:
+    """tokenmin plan <api|pro|max|unknown|status>"""
+    import argparse as _ap
+    sp = _ap.ArgumentParser(prog="tokenmin plan", description="Set your Claude billing plan so savings get framed in the right units.")
+    sp.add_argument("action", choices=_VALID_PLANS + ("status",))
+    a = sp.parse_args(args)
+    c = _C(_ansi_supported())
+    s = _load_settings()
+    if a.action == "status":
+        plan = s.get("billing_plan", "unknown")
+        asked = "yes" if s.get("billing_plan_asked") else "no (will prompt on next interactive run)"
+        print(f"  billing plan:  {c.BOLD}{plan}{c.RESET}")
+        print(f"  consent asked: {asked}")
+        print(f"  settings file: {_SETTINGS_PATH}")
+        print()
+        print(f"  change with:   {c.CYAN}tokenmin plan api|pro|max|unknown{c.RESET}")
+        return 0
+    s["billing_plan"] = a.action
+    s["billing_plan_asked"] = True
+    _save_settings(s)
+    print(f"{c.GREEN}✓{c.RESET} billing plan set to {c.BOLD}{a.action}{c.RESET}")
+    return 0
 
 
 _CANONICAL_INSTALL_DIR = Path.home() / ".tokenmin"

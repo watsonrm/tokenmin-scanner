@@ -23,4 +23,6 @@ python3 "${here}/test_scrubber.py"
 echo
 python3 "${here}/test_uninstall.py"
 echo
+python3 "${here}/test_cost_framing.py"
+echo
 echo "tokenmin tests: ok"
