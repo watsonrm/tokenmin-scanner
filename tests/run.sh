@@ -21,4 +21,6 @@ export TOKENMIN_SALT_PATH="${repo}/tests/fixtures/test.salt"
 
 python3 "${here}/test_scrubber.py"
 echo
+python3 "${here}/test_uninstall.py"
+echo
 echo "tokenmin tests: ok"

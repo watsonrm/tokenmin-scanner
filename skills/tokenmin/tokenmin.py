@@ -2065,69 +2065,259 @@ def _telemetry_cmd(args: list[str]) -> int:
     return 2
 
 
+_CANONICAL_INSTALL_DIR = Path.home() / ".tokenmin"
+
+
+def _is_real_install(root: Path) -> bool:
+    """Refuse to uninstall from anywhere except the canonical install root.
+
+    A real install always lives at ~/.tokenmin (install.sh hardcodes DEST).
+    Dev trees (a git clone of the source repo where someone imports tokenmin.py
+    for testing) are the one place `_install_dir()` resolves to a non-install
+    path via __file__ — deleting that would nuke the user's working copy.
+    """
+    try:
+        return root.resolve() == _CANONICAL_INSTALL_DIR.resolve()
+    except OSError:
+        return False
+
+
+def _shell_rc_candidates() -> list[Path]:
+    """Files the installer may have touched. Order matches install.sh."""
+    home = Path.home()
+    return [
+        home / ".zshrc",
+        home / ".bashrc",
+        home / ".bash_profile",
+        home / ".config" / "fish" / "config.fish",
+    ]
+
+
+def _strip_installer_marker(rc: Path) -> bool:
+    """Remove '# Added by tokenmin installer on <ts>' + the line right after it.
+
+    install.sh always writes the marker immediately followed by the PATH export
+    line, so dropping the pair is safe and doesn't touch anything the user
+    added by hand. Returns True iff the file was modified.
+    """
+    try:
+        original = rc.read_text()
+    except OSError:
+        return False
+    lines = original.splitlines(keepends=True)
+    out: list[str] = []
+    skip_next = False
+    changed = False
+    for line in lines:
+        if skip_next:
+            skip_next = False
+            changed = True
+            continue
+        if line.lstrip().startswith("# Added by tokenmin installer on"):
+            skip_next = True
+            changed = True
+            continue
+        out.append(line)
+    if not changed:
+        return False
+    new = "".join(out)
+    # Collapse a trailing run of blank lines so we don't leave an ever-growing
+    # gap after repeated install/uninstall cycles.
+    while new.endswith("\n\n\n"):
+        new = new[:-1]
+    try:
+        rc.write_text(new)
+    except OSError:
+        return False
+    return True
+
+
+def _uninstall_claude_plugin() -> bool:
+    """Best-effort removal of the Claude Code plugin registration."""
+    import shutil as _sh
+    import subprocess as _sp
+    if not _sh.which("claude"):
+        return False
+    try:
+        listed = _sp.run(["claude", "plugin", "list"], capture_output=True, text=True, timeout=10)
+    except (OSError, _sp.TimeoutExpired):
+        return False
+    if "tokenmin@tokenmin" not in (listed.stdout or ""):
+        return False
+    try:
+        _sp.run(["claude", "plugin", "uninstall", "tokenmin@tokenmin"], capture_output=True, timeout=10)
+        _sp.run(["claude", "plugin", "marketplace", "remove", "tokenmin"], capture_output=True, timeout=10)
+    except (OSError, _sp.TimeoutExpired):
+        return False
+    return True
+
+
 def _uninstall(args: list[str]) -> int:
-    """Remove the install dir + symlink. Prompts before deleting state."""
+    """Remove the install dir, symlink, shell-rc PATH lines, and Claude Code plugin.
+
+    One-line success output matches the install greet:
+        tokenmin 0.12.2 uninstalled
+    Pass --verbose / -v to see each step. Pass --dry-run to plan without acting.
+    """
     import argparse as _ap
-    sp = _ap.ArgumentParser(prog="tokenmin uninstall", description="Remove tokenmin from this machine.")
-    sp.add_argument("--keep-state", action="store_true", help="Keep ~/.tokenmin/.salt and audit.log (default removes them)")
+    sp = _ap.ArgumentParser(
+        prog="tokenmin uninstall",
+        description="Remove tokenmin. Strips installer-added PATH lines + Claude Code plugin.",
+    )
     sp.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    sp.add_argument("--verbose", "-v", action="store_true", help="Print each step (default is one line)")
+    sp.add_argument("--dry-run", action="store_true", help="Show the plan; touch nothing")
     a = sp.parse_args(args)
+
+    verbose = a.verbose or bool(os.environ.get("TOKENMIN_VERBOSE"))
+    c = _C(_ansi_supported())
 
     root = _install_dir()
     bin_link = Path.home() / ".local" / "bin" / "tokenmin"
-    state_dir = Path.home() / ".tokenmin"
 
-    print("tokenmin uninstall will remove:")
-    print(f"  install dir:  {root}")
+    # Safety: refuse to uninstall from a dev/source tree. The only legitimate
+    # install root is ~/.tokenmin (install.sh hardcodes it). If we resolved to
+    # somewhere else, the user is running uninstall from a clone — bail.
+    if not _is_real_install(root):
+        print(
+            f"tokenmin uninstall: refusing to remove {root}\n"
+            f"  this doesn't look like a real install (expected {_CANONICAL_INSTALL_DIR}).\n"
+            f"  if you want to remove a real install, run `~/.tokenmin/tokenmin uninstall`.",
+            file=sys.stderr,
+        )
+        return 4
+
+    # Capture version BEFORE we delete anything so the success line is honest.
+    version_str = ""
+    version_file = root / "VERSION"
+    if version_file.is_file():
+        try:
+            version_str = " " + version_file.read_text().strip()
+        except OSError:
+            pass
+
+    # Build the plan. Each action returns (ok, detail).
+    import shutil as _sh
+    plan: list[tuple[str, callable]] = []
+
     if bin_link.is_symlink():
-        print(f"  symlink:      {bin_link}")
-    if not a.keep_state and state_dir.exists() and state_dir != root:
-        print(f"  state dir:    {state_dir}  (salt, audit log)")
-    if state_dir == root:
-        print(f"  (state lives inside install dir; --keep-state has no effect)")
+        target_str = ""
+        try:
+            target_str = str(bin_link.resolve())
+        except OSError:
+            pass
+        # Resolve root too — on macOS, $TMPDIR is /var/folders/... which
+        # resolves to /private/var/folders/..., so an unresolved prefix check
+        # silently fails to recognize our own symlink.
+        try:
+            root_str = str(root.resolve())
+        except OSError:
+            root_str = str(root)
+        points_at_us = target_str.startswith(root_str)
+        if points_at_us:
+            def _rm_link() -> tuple[bool, str]:
+                try:
+                    bin_link.unlink()
+                    return True, str(bin_link)
+                except OSError as exc:
+                    return False, f"{bin_link}: {exc}"
+            plan.append((f"symlink {bin_link}", _rm_link))
+        else:
+            plan.append((
+                f"symlink {bin_link} (left alone — points at {target_str}, not us)",
+                lambda: (True, "left alone"),
+            ))
+
+    if root.exists():
+        def _rm_root() -> tuple[bool, str]:
+            try:
+                _sh.rmtree(root)
+                return True, str(root)
+            except OSError as exc:
+                return False, f"{root}: {exc}"
+        plan.append((f"install dir {root}", _rm_root))
+
+    for rc in _shell_rc_candidates():
+        if rc.exists():
+            try:
+                content = rc.read_text()
+            except OSError:
+                continue
+            if "# Added by tokenmin installer on" in content:
+                def _strip(_rc=rc) -> tuple[bool, str]:
+                    ok = _strip_installer_marker(_rc)
+                    return ok, f"PATH line removed from {_rc}"
+                plan.append((f"shell-rc PATH line in {rc}", _strip))
+
+    # Claude Code plugin — only add if it's actually registered.
+    import shutil as _sh2
+    import subprocess as _sp2
+    if _sh2.which("claude"):
+        try:
+            listed = _sp2.run(["claude", "plugin", "list"], capture_output=True, text=True, timeout=10)
+            if "tokenmin@tokenmin" in (listed.stdout or ""):
+                def _rm_plugin() -> tuple[bool, str]:
+                    ok = _uninstall_claude_plugin()
+                    return ok, "Claude Code plugin tokenmin@tokenmin"
+                plan.append(("Claude Code plugin tokenmin@tokenmin", _rm_plugin))
+        except (OSError, _sp2.TimeoutExpired):
+            pass
+
+    if not plan:
+        print(f"tokenmin{version_str}: nothing to uninstall (no install dir, symlink, PATH line, or plugin found)")
+        return 0
+
+    # Dry-run / verbose / interactive confirmation share the same plan listing.
+    if a.dry_run or verbose:
+        print("tokenmin uninstall plan:", file=sys.stderr)
+        for label, _ in plan:
+            print(f"  - {label}", file=sys.stderr)
+        if a.dry_run:
+            print(f"tokenmin{version_str} uninstall dry-run — nothing removed", file=sys.stderr)
+            return 0
 
     if not a.yes:
         if not sys.stdin.isatty():
             print("tokenmin uninstall: refusing non-interactive run without --yes", file=sys.stderr)
             return 2
-        ans = input("proceed? [y/N] ").strip().lower()
+        if not verbose:
+            prompt = f"remove tokenmin ({len(plan)} item{'s' if len(plan) != 1 else ''})? [y/N] "
+        else:
+            prompt = "remove? [y/N] "
+        try:
+            ans = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
         if ans not in ("y", "yes"):
-            print("aborted.")
+            print("aborted.", file=sys.stderr)
             return 1
 
-    import shutil
-    # Remove symlink if it points at us.
-    if bin_link.is_symlink():
-        try:
-            target = bin_link.resolve()
-            if target == (root / "tokenmin").resolve():
-                bin_link.unlink()
-                print(f"removed symlink: {bin_link}")
-            else:
-                print(f"left {bin_link} alone (points at {target}, not us)")
-        except OSError as exc:
-            print(f"warning: could not remove {bin_link}: {exc}", file=sys.stderr)
+    # Move CWD out of root if we're sitting inside it, otherwise rmtree fails.
+    try:
+        cwd = Path.cwd().resolve()
+        if str(cwd).startswith(str(root.resolve())):
+            os.chdir(Path.home())
+    except OSError:
+        pass
 
-    # Remove install dir.
-    if root.exists():
-        try:
-            shutil.rmtree(root)
-            print(f"removed install dir: {root}")
-        except OSError as exc:
-            print(f"error: could not remove {root}: {exc}", file=sys.stderr)
-            return 3
+    failures: list[str] = []
+    for label, action in plan:
+        ok, detail = action()
+        if ok:
+            if verbose:
+                print(f"  {c.GREEN}✓{c.RESET} {detail}", file=sys.stderr)
+        else:
+            failures.append(detail)
+            print(f"  {c.YELLOW}!{c.RESET} {detail}", file=sys.stderr)
 
-    # State dir cleanup (only if separate from install dir).
-    if not a.keep_state and state_dir.exists() and state_dir != root:
-        try:
-            shutil.rmtree(state_dir)
-            print(f"removed state dir:   {state_dir}")
-        except OSError as exc:
-            print(f"warning: could not remove {state_dir}: {exc}", file=sys.stderr)
-
-    print()
-    print("uninstalled. you may also want to remove the PATH line the installer added")
-    print("to your shell rc (~/.zshrc / ~/.bashrc / ~/.config/fish/config.fish).")
+    if failures:
+        print(
+            f"tokenmin{version_str} uninstalled with {len(failures)} warning(s) — "
+            f"rerun with -v for details",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"tokenmin{version_str} uninstalled")
     return 0
 
 
