@@ -28,6 +28,7 @@ import re
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -231,5 +232,37 @@ class ProjectScopedDetection(unittest.TestCase):
         self.assertIn("project-level", finding["evidence"].lower())
 
 
+class LastRunPersistsBillingPlan(unittest.TestCase):
+    """Scanner #5 follow-up: `_save_last_run` must persist `billing_plan` so
+    `tokenmin show <id>` can render impact in the right unit. Without this,
+    show always reads plan='unknown' and shows dollars even on Max.
+
+    Found the hard way after the first v0.12.4 dogfood — `show low-impact`
+    listed everything in $/mo despite plan=max."""
+
+    def test_save_payload_includes_billing_plan(self):
+        # Import the save fn and inspect its payload via a tempdir.
+        import tokenmin
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(
+                tokenmin, "_last_run_path",
+                return_value=Path(tmp) / "last_run.json",
+            ):
+                fake_result = {
+                    "snapshot": {"sessions": 1},
+                    "findings": [{"id": "x", "low_impact": False, "savings_usd_per_month": 100}],
+                    "total_savings_usd_per_month": 100.0,
+                    "billing_plan": "max",
+                    "engine_version": "0.6",
+                }
+                tokenmin._save_last_run(fake_result)
+                saved = json.loads((Path(tmp) / "last_run.json").read_text())
+                self.assertEqual(saved.get("billing_plan"), "max",
+                                 "billing_plan dropped from last_run.json — show will leak dollars")
+
+
 if __name__ == "__main__":
+    # unittest.mock is needed by LastRunPersistsBillingPlan; import lazily
+    # so module-level import order stays clean.
+    import unittest.mock  # noqa: F401
     unittest.main(verbosity=2)

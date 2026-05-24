@@ -1166,6 +1166,11 @@ def _save_last_run(result: dict) -> None:
         "snapshot": result.get("snapshot", {}),
         "findings": result.get("findings", []),
         "total_savings_usd_per_month": result.get("total_savings_usd_per_month", 0.0),
+        # v0.12.4: persist billing_plan so `tokenmin show <id>` can format
+        # impact in the right unit (quota stretch for Pro/Max, dollars for
+        # API). Without this, show always defaults to "unknown" → dollars
+        # leak even after the v0.12.3 main-audit fix.
+        "billing_plan": result.get("billing_plan", "unknown"),
         "engine_version": result.get("engine_version", ""),
     }
     data = json.dumps(payload, indent=2, default=str).encode("utf-8")
