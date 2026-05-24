@@ -1,0 +1,33 @@
+# Tokenmin
+
+> Open-source Claude usage advisor. Reads every Anthropic optimization doc (prompt caching, parallel tools, MCP hygiene, model routing, context discipline), watches the user's actual Claude usage in `~/.claude/`, and renders a ranked report of the next dollars they can recover. Apache-2.0 across the board (scanner + engine + server skeleton). Runs entirely on the user's machine by default; an opt-in hosted endpoint is on the roadmap.
+
+## Docs
+
+- [README.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/README.md): user-facing overview, install, what gets collected, trust posture, full layout map.
+- [ROADMAP.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/ROADMAP.md): priority-ordered next items — the hosted Vercel analyze endpoint, native Claude Desktop adapter, rule-base community contributions.
+- [SECURITY.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/SECURITY.md): threat model, anonymization invariants, disclosure path (`security@rmwcommerce.com`, 2-day ack, 14-day patch SLA on confirmed high-severity).
+- [SPEC.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/SPEC.md): architecture, data model, scanner↔engine hand-off protocol, snapshot schema.
+- [LICENSING.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/LICENSING.md): Apache-2.0 file layout — `LICENSE`, `NOTICE`, and per-file license headers.
+- [AGENTS.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/AGENTS.md): guidance for AI coding agents working in this repo.
+- [CLAUDE.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/CLAUDE.md): Claude Code import of `AGENTS.md` plus a Claude-Code-specific addendum.
+
+## Code
+
+- [skills/tokenmin/tokenmin.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/skills/tokenmin/tokenmin.py): orchestrator CLI — collect → anonymize → analyze → render. The entry point most agent work touches.
+- [skills/tokenmin/analyzer.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/skills/tokenmin/analyzer.py): walks `~/.claude/` sessions, settings, agents, skills, MCP config.
+- [skills/tokenmin/analyzer_chat_export.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/skills/tokenmin/analyzer_chat_export.py): claude.ai / Claude Desktop chat-export parser.
+- [skills/tokenmin/anonymize.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/skills/tokenmin/anonymize.py): the scrubber — HMAC-SHA256 hashing keyed by per-install salt, secret-pattern coverage, ReDoS-safe input cap. Read `SECURITY.md` before changing.
+- [engine/tokenmin_engine.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/engine/tokenmin_engine.py): engine adapter — pure deterministic analysis over an anonymized snapshot. No I/O, no network, no `~/.claude` knowledge.
+- [engine/patterns.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/engine/patterns.py): detection rule base. Where new optimization patterns get added.
+- [engine/report.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/engine/report.py): markdown report renderer.
+- [engine/pricing.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/engine/pricing.py) and [engine/pricing.json](https://github.com/watsonrm/tokenmin-scanner/blob/main/engine/pricing.json): pricing lookup for cost estimates.
+- [server/tokenmin_server.py](https://github.com/watsonrm/tokenmin-scanner/blob/main/server/tokenmin_server.py): local HTTP server skeleton for `--submit-url` testing. Not the hosted endpoint — that's a roadmap item.
+- [tokenmin](https://github.com/watsonrm/tokenmin-scanner/blob/main/tokenmin): wrapper script — auto-update, version, doctor.
+
+## Optional
+
+- [bin/sources.json](https://github.com/watsonrm/tokenmin-scanner/blob/main/bin/sources.json): curated list of trusted Claude-optimization sources the detector-research watcher monitors. Every entry carries a `trust_reason`.
+- [tests/](https://github.com/watsonrm/tokenmin-scanner/tree/main/tests): stdlib `unittest` suite. `bash tests/run.sh` is the canonical test runner; CI invokes it across Python 3.10 / 3.11 / 3.12.
+- [engine/sample_output.md](https://github.com/watsonrm/tokenmin-scanner/blob/main/engine/sample_output.md): a sample rendered report (no real data).
+- [llms-full.txt](https://github.com/watsonrm/tokenmin-scanner/blob/main/llms-full.txt): the full text of README + ROADMAP + SECURITY + SPEC + LICENSING concatenated for context-window paste.
