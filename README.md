@@ -1,8 +1,14 @@
 # Tokenmin Scanner
 
-**The public, Apache-2.0 audit copy of Tokenmin.** This is the code that decides
-what (if anything) leaves your machine when you run `tokenmin`. About 5 minutes
-of reading, end to end.
+**Every Claude optimization doc, distilled into one command.** Anthropic publishes
+the playbook — caching, parallel tools, MCP hygiene, model routing — scattered
+across their docs, engineering blog, and changelog. Tokenmin reads them so you
+don't have to, watches your actual usage, and shows you the next dollar you can
+save.
+
+This repo is the **public, Apache-2.0 audit copy** of Tokenmin — the code that
+decides what (if anything) leaves your machine when you run `tokenmin`. About
+5 minutes of reading, end to end.
 
 The deal: Tokenmin is free during the friends-and-family preview in exchange for
 your anonymized usage data. The scanner that does the anonymization is open
