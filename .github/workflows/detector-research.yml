@@ -4,7 +4,8 @@ name: detector-research
 # patterns and opens a tokenmin-scanner issue per newly-seen post for human triage.
 #
 # Runs WEEKLY in the cloud (GitHub Actions) — survives laptop shutdown by design.
-# The script lives at bin/detector-research.py; state at bin/.research-seen.json.
+# The script lives at bin/detector-research.py; the curated source list lives at
+# bin/sources.json (PR there to add a source); state at bin/.research-seen.json.
 
 on:
   schedule:
