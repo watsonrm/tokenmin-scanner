@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Tokenmin detector-research watcher.
+"""Tokenmin detector-research watcher — Stage 1 (URL discovery).
 
 Runs from GitHub Actions on a weekly schedule. Pure stdlib (urllib + json
 + re + xml.etree) — no pip install in CI. Watches a curated list of
 public sources for new Claude usage / optimization patterns, diffs against
-a checked-in state file, and opens one GitHub issue per newly-seen post
-tagged for human triage.
+a checked-in state file, and hands the fresh-URL list off to Stage 2
+(`bin/detector-synthesize.py`) for Claude-judged synthesis.
+
+Two-stage architecture (added 2026-05-24, see scanner#15):
+  Stage 1 (this file): URL discovery. Diff vs .research-seen.json,
+    write the fresh list to .research-fresh.json, commit updated seen state.
+    DOES NOT file per-URL issues — that was the v1 behavior (`--legacy-file-issues`
+    preserves it as an escape hatch).
+  Stage 2 (detector-synthesize.py): fetch each fresh URL, ask Claude whether
+    it suggests a new detector tokenmin doesn't already have, file a
+    properly-formatted candidate issue only on real signals.
 
 Source list lives in bin/sources.json — edit there to add/remove. Each
 source declares a tier (1=Anthropic first-party, auto-trusted; 2=verified
@@ -34,6 +43,7 @@ Design choices:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -47,6 +57,7 @@ from pathlib import Path
 
 BIN_DIR = Path(__file__).resolve().parent
 STATE_PATH = BIN_DIR / ".research-seen.json"
+FRESH_PATH = BIN_DIR / ".research-fresh.json"
 SOURCES_PATH = BIN_DIR / "sources.json"
 MAX_NEW_ISSUES_PER_RUN = 5
 USER_AGENT = "tokenmin-detector-research/2.0 (+https://github.com/watsonrm/tokenmin-scanner)"
@@ -279,10 +290,31 @@ def _file_issue(repo: str, entry: dict) -> bool:
         return False
 
 
-def main() -> int:
+def _save_fresh(entries: list[dict]) -> None:
+    """Stage-1 → Stage-2 handoff. Stage 2 (detector-synthesize.py) reads this."""
+    FRESH_PATH.write_text(
+        json.dumps({"entries": entries}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="tokenmin detector-research stage-1 URL discovery")
+    parser.add_argument(
+        "--legacy-file-issues",
+        action="store_true",
+        help=(
+            "Escape hatch: restore the v1 behavior and file one GitHub issue per "
+            "fresh URL (no Claude judgment). Use this if the synthesis stage is "
+            "broken or you want to run stage 1 standalone."
+        ),
+    )
+    args = parser.parse_args(argv)
+
     repo = os.environ.get("GITHUB_REPOSITORY", "watsonrm/tokenmin-scanner")
     sources = _load_sources()
-    print(f"detector-research: scanning {len(sources)} sources, target repo={repo}")
+    mode = "legacy (per-URL issues)" if args.legacy_file_issues else "stage-1 (handoff to synthesis)"
+    print(f"detector-research [{mode}]: scanning {len(sources)} sources, target repo={repo}")
     state = _load_state()
     seen = set(state.get("seen_urls", []))
     print(f"  state: {len(seen)} URL(s) previously seen")
@@ -308,7 +340,30 @@ def main() -> int:
         fresh.append(c)
 
     print(f"  fresh: {len(fresh)} new URL(s)")
+
+    if not args.legacy_file_issues:
+        # Stage-1 default: hand the full fresh list to stage 2. The synthesis
+        # stage applies its own budget (cost cap), so we don't throttle here.
+        # Mark all fresh URLs as seen now — stage 2 is best-effort and we
+        # don't want to re-judge the same URL on the next cron if stage 2
+        # ran out of budget halfway through. The digest issue records what
+        # got skipped this week.
+        _save_fresh(fresh)
+        for entry in fresh:
+            seen.add(entry["url"])
+        state["seen_urls"] = sorted(seen)
+        _save_state(state)
+        print(
+            f"  done (stage 1): wrote {len(fresh)} URL(s) to {FRESH_PATH.name}, "
+            f"state updated ({len(seen)} URL(s) tracked). Stage 2 will judge."
+        )
+        return 0
+
+    # Legacy path: file one issue per URL, no synthesis. Preserves v1 behavior
+    # for manual runs / synthesis-broken fallback.
     if not fresh:
+        # Still touch the fresh artifact so stage 2 (if it runs anyway) is a no-op.
+        _save_fresh([])
         print("  nothing new this week. Done.")
         return 0
 
@@ -329,7 +384,10 @@ def main() -> int:
 
     state["seen_urls"] = sorted(seen)
     _save_state(state)
-    print(f"  done: {filed} issue(s) filed, state updated ({len(seen)} URL(s) tracked)")
+    # Legacy mode bypasses stage 2 — empty the fresh artifact so a later
+    # stage-2 run on the same checkout doesn't double-process these URLs.
+    _save_fresh([])
+    print(f"  done (legacy): {filed} issue(s) filed, state updated ({len(seen)} URL(s) tracked)")
     return 0
 
 

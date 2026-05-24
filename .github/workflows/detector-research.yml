@@ -1,11 +1,22 @@
 name: detector-research
 
-# Watches public Anthropic + ecosystem sources for new Claude usage / optimization
-# patterns and opens a tokenmin-scanner issue per newly-seen post for human triage.
+# Two-stage weekly research pipeline:
+#
+#   Stage 1 (bin/detector-research.py): discovers new URLs from the curated
+#     public-source list and writes the fresh-URL list to .research-fresh.json
+#     (handoff artifact, committed). Does NOT file per-URL issues.
+#   Stage 2 (bin/detector-synthesize.py): fetches each fresh URL, asks Claude
+#     whether it suggests a new tokenmin detector, files a properly-formatted
+#     research-candidate issue only on genuine signals + appends to the weekly
+#     digest issue.
 #
 # Runs WEEKLY in the cloud (GitHub Actions) — survives laptop shutdown by design.
-# The script lives at bin/detector-research.py; the curated source list lives at
-# bin/sources.json (PR there to add a source); state at bin/.research-seen.json.
+# Source list lives at bin/sources.json (PR there to add a source); the synthesis
+# prompt lives at bin/synthesis-prompt.md so editorial changes are one-line diffs.
+#
+# REQUIRED SECRET: ANTHROPIC_API_KEY — add via
+#   gh secret set ANTHROPIC_API_KEY --repo watsonrm/tokenmin-scanner
+# Until added, stage 2 is a no-op (prints "ANTHROPIC_API_KEY not set; nothing to do.").
 
 on:
   schedule:
@@ -15,8 +26,8 @@ on:
   workflow_dispatch: {}  # manual trigger for the first run + debugging
 
 permissions:
-  contents: write   # to commit the updated .research-seen.json
-  issues: write     # to file the per-source candidate issues
+  contents: write   # to commit the updated .research-seen.json + .research-fresh.json
+  issues: write     # to file research-candidate issues + maintain the weekly digest
 
 concurrency:
   group: detector-research
@@ -46,21 +57,35 @@ jobs:
               --color "C5DEF5" || true
           fi
 
-      - name: Run detector-research
+      - name: Stage 1 — detector-research (URL discovery)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python3 bin/detector-research.py
 
-      - name: Commit updated seen state (if changed)
+      - name: Stage 2 — detector-synthesize (Claude-judged candidates)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Soft cost cap per run in USD. When cumulative API spend crosses this,
+          # the remaining fresh URLs are recorded in the digest as "not triaged
+          # this week" and deferred to the next cron.
+          TOKENMIN_SYNTH_BUDGET: "1.00"
+          # Model selector. claude-sonnet-4-6 is the default; switch to
+          # claude-haiku-4-5 for ~8x cheaper synthesis if the prompt holds up.
+          TOKENMIN_SYNTH_MODEL: "claude-sonnet-4-6"
+        run: python3 bin/detector-synthesize.py
+
+      - name: Commit updated state (if changed)
         run: |
           set -euo pipefail
-          if [[ -z "$(git status --porcelain bin/.research-seen.json)" ]]; then
+          if [[ -z "$(git status --porcelain bin/.research-seen.json bin/.research-fresh.json)" ]]; then
             echo "no state changes; nothing to commit"
             exit 0
           fi
           git config user.name  "tokenmin-detector-research"
           git config user.email "tokenmin-research@users.noreply.github.com"
-          git add bin/.research-seen.json
-          git commit -m "research: update seen state ($(date -u +%Y-%m-%d))"
+          git add bin/.research-seen.json bin/.research-fresh.json
+          git commit -m "research: update seen + fresh state ($(date -u +%Y-%m-%d))"
           git push

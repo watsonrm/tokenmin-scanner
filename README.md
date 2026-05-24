@@ -200,6 +200,36 @@ See [`ROADMAP.md`](ROADMAP.md) for what's next. Highlights:
 - **Rule-base community contributions** once enough usage data validates
   which rules carry their weight.
 
+## Detector research pipeline
+
+The detector rule-base grows from a weekly scan of Anthropic's docs / engineering
+blog + a curated allowlist of community sources. The pipeline runs in GitHub
+Actions (`.github/workflows/detector-research.yml`) every Monday and is two stages:
+
+1. **`bin/detector-research.py`** — URL discovery. Diffs the curated source list
+   (`bin/sources.json`) against `bin/.research-seen.json`, writes the fresh URLs
+   to `bin/.research-fresh.json`. Pure stdlib; no per-URL issues filed.
+2. **`bin/detector-synthesize.py`** — Claude-judged synthesis. For each fresh
+   URL: fetch the page, ask Claude (via the prompt in `bin/synthesis-prompt.md`)
+   whether it suggests a new detector tokenmin doesn't already have. Files a
+   structured `research-candidate` issue only on genuine signals; logs every
+   verdict to a weekly digest issue.
+
+Cost-capped at `$1.00/run` by default (`TOKENMIN_SYNTH_BUDGET`); model
+selectable via `TOKENMIN_SYNTH_MODEL` (default `claude-sonnet-4-6`, or
+`claude-haiku-4-5` for ~8× cheaper synthesis).
+
+**Required one-time setup:** add the Anthropic API key as a repo secret.
+Until this is set, stage 2 is a no-op:
+
+```bash
+gh secret set ANTHROPIC_API_KEY --repo watsonrm/tokenmin-scanner
+```
+
+Manual escape hatch: `python3 bin/detector-research.py --legacy-file-issues`
+restores the original "one issue per fresh URL, no Claude judgment" behavior
+if the synthesis stage is ever broken.
+
 ## Repos
 
 | Repo | Visibility | Purpose |
