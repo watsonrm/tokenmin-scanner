@@ -88,6 +88,9 @@ class ConfigSnapshot:
     # ENABLE_TOOL_SEARCH=auto recovers ~70K context tokens (Anthropic measured
     # 191,300 → 122,800). Surface its presence so the detector can recommend.
     enable_tool_search: str | None = None
+    # Billing plan for Claude (e.g. api, pro, max, unknown)
+    billing_plan: str | None = None
+
 
 
 @dataclass
