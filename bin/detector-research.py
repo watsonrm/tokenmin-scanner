@@ -84,14 +84,128 @@ def _safe(label: str, fn, *args, **kwargs) -> list[dict]:
 
 # ----- fetcher types --------------------------------------------------------
 
+# Strings that are technically valid 10-200 char text but never a real post title.
+# Card chrome on anthropic.com/news + most CMS templates renders these alongside
+# titles, and the old scraper kept grabbing them instead of the title.
+_DATE_LIKE = re.compile(
+    r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\s*$",
+    re.IGNORECASE,
+)
+_CATEGORY_LABELS = {
+    "announcements", "announcement", "product", "news", "engineering",
+    "research", "policy", "company", "security", "interpretability",
+    "alignment", "education", "customers", "press", "blog", "podcast",
+}
+
+
+def _looks_like_post_title(text: str) -> bool:
+    """Heuristic: does this string look like an actual post title vs card chrome?
+
+    Filters out: dates, single-word category labels, "May 25, 2026"-style
+    timestamps, anything <10 chars or >200 chars after normalization.
+    """
+    if not text:
+        return False
+    text = text.strip()
+    if len(text) < 10 or len(text) > 200:
+        return False
+    if _DATE_LIKE.match(text):
+        return False
+    words = text.split()
+    # Single-word labels are almost always category chips, not titles.
+    if len(words) <= 1:
+        return False
+    # Two-word strings that are category labels (e.g. "Product announcements") —
+    # check if every word lowercased is in the noise set.
+    if len(words) <= 2 and all(w.lower().rstrip(".,") in _CATEGORY_LABELS for w in words):
+        return False
+    return True
+
+
+def _strip_html_tags(html: str) -> str:
+    """Strip all HTML tags + collapse whitespace + decode common entities."""
+    no_tags = re.sub(r"<[^>]+>", " ", html)
+    no_tags = re.sub(r"\s+", " ", no_tags).strip()
+    # Decode the entities that show up in real-world HTML — keep it cheap;
+    # Python's html.unescape would be more thorough but it's a stdlib import
+    # we can avoid.
+    for entity, char in (
+        ("&#x27;", "'"), ("&#39;", "'"),
+        ("&amp;", "&"),
+        ("&quot;", '"'), ("&#34;", '"'),
+        ("&lt;", "<"), ("&gt;", ">"),
+        ("&nbsp;", " "), ("&mdash;", "—"), ("&ndash;", "–"),
+        ("&hellip;", "…"), ("&rsquo;", "'"), ("&lsquo;", "'"),
+        ("&rdquo;", "”"), ("&ldquo;", "“"),
+    ):
+        no_tags = no_tags.replace(entity, char)
+    return no_tags
+
+
+def _extract_post_title(inner_html: str) -> str | None:
+    """Find the best post-title candidate inside the inner HTML of a link.
+
+    Strategy (in order):
+      1. Look for heading tags inside the link (`<h1>`..`<h4>`). Use the first
+         heading whose text looks like a title.
+      2. Look for elements with class names containing "title" or "headline".
+      3. Fall back to the longest text chunk that passes the title heuristic.
+    """
+    # Remove script/style blocks defensively.
+    cleaned = re.sub(
+        r"<(script|style)\b[^>]*>.*?</\1>",
+        "",
+        inner_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # 1. Headings.
+    for tag in ("h1", "h2", "h3", "h4"):
+        for m in re.finditer(
+            rf"<{tag}\b[^>]*>(.*?)</{tag}>", cleaned, re.IGNORECASE | re.DOTALL
+        ):
+            text = _strip_html_tags(m.group(1))
+            if _looks_like_post_title(text):
+                return text
+
+    # 2. Title-ish class names.
+    for m in re.finditer(
+        r'<[^>]*class="[^"]*(?:title|headline)[^"]*"[^>]*>(.*?)</',
+        cleaned,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        text = _strip_html_tags(m.group(1))
+        if _looks_like_post_title(text):
+            return text
+
+    # 3. Longest text chunk that looks like a title.
+    chunks = re.findall(r">([^<]{10,200})<", cleaned)
+    titles = [
+        re.sub(r"\s+", " ", c).strip()
+        for c in chunks
+    ]
+    titles = [t for t in titles if _looks_like_post_title(t)]
+    if not titles:
+        return None
+    return max(titles, key=len)
+
+
 def fetch_html_index(name: str, base_url: str, index_url: str, slug_prefix: str) -> list[dict]:
-    """Scrape an index page for hrefs matching slug_prefix + visible title text."""
+    """Scrape an index page for hrefs matching slug_prefix + extract their post titles.
+
+    Pattern: capture the FULL `<a>...</a>` block, then extract the title from
+    its inner HTML using heading tags / title-class elements / longest-chunk
+    fallback. The prior heuristic ("first text after href") grabbed card chrome
+    like dates and category labels — anthropic.com/news routinely renders
+    "<a><h3>Real Title</h3><span>May 25, 2026</span><span>Announcements</span></a>"
+    and the old regex captured "May 25, 2026" as the title.
+    """
     html = _fetch(index_url)
-    # Allow letters, digits, hyphens, and slashes after the prefix so this works
-    # for both flat (/news/<slug>) and nested (/docs/en/<area>/<slug>) URL shapes.
     pattern = re.compile(
-        r'href="(' + re.escape(slug_prefix) + r'[a-z0-9\-/]+)"[^>]*>\s*(?:<[^>]+>\s*)*([^<]{10,200})',
-        re.IGNORECASE,
+        r'<a\b[^>]*href="('
+        + re.escape(slug_prefix)
+        + r'[a-z0-9\-/]+)"[^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
     )
     seen_slugs: set[str] = set()
     out: list[dict] = []
@@ -103,7 +217,11 @@ def fetch_html_index(name: str, base_url: str, index_url: str, slug_prefix: str)
         if slug in seen_slugs:
             continue
         seen_slugs.add(slug)
-        title = re.sub(r"\s+", " ", m.group(2)).strip()
+        title = _extract_post_title(m.group(2))
+        if not title:
+            # Better to skip than to file noise. The URL stays unfiled this
+            # run and may be picked up next time if the page restructures.
+            continue
         out.append({
             "url": f"{base_url}{slug}",
             "title": title,
