@@ -46,6 +46,10 @@ concurrency:
 jobs:
   scan-and-file:
     runs-on: ubuntu-latest
+    # Bridge the secret-availability check into an env var so step-level `if:`
+    # conditions can read it (GitHub Actions doesn't allow `secrets.*` in `if:`).
+    env:
+      HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -71,11 +75,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          # When no Anthropic API key is configured, fall back to legacy
-          # per-URL filing so the cron still produces visible issues. When
-          # the key IS set, Stage 1 writes the handoff file silently and
-          # Stage 2 takes over the filing role.
-          HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
         run: |
           if [[ "${HAS_ANTHROPIC_KEY}" == "true" ]]; then
             echo "ANTHROPIC_API_KEY present — Stage 1 hands off to Stage 2."
@@ -88,7 +87,7 @@ jobs:
       - name: Stage 2 — detector-synthesize (Claude-judged candidates)
         # Skip entirely when the API key isn't configured — Stage 1 already
         # handled filing in legacy mode.
-        if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        if: env.HAS_ANTHROPIC_KEY == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
