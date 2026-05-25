@@ -14,9 +14,19 @@ name: detector-research
 # Source list lives at bin/sources.json (PR there to add a source); the synthesis
 # prompt lives at bin/synthesis-prompt.md so editorial changes are one-line diffs.
 #
-# REQUIRED SECRET: ANTHROPIC_API_KEY — add via
+# OPTIONAL SECRET: ANTHROPIC_API_KEY — add via
 #   gh secret set ANTHROPIC_API_KEY --repo watsonrm/tokenmin-scanner
-# Until added, stage 2 is a no-op (prints "ANTHROPIC_API_KEY not set; nothing to do.").
+#
+# When ANTHROPIC_API_KEY is set:
+#   Stage 1 hands off fresh URLs to Stage 2; Claude reads each URL and files
+#   structured candidate issues only on genuine signals.
+#
+# When ANTHROPIC_API_KEY is NOT set:
+#   The workflow falls back to legacy-mode: Stage 1 files one issue per fresh
+#   URL (noisier but useful — the prior v0.12.5 behavior). Stage 2 is skipped.
+#
+# Either way, the cron produces value. Setting the secret upgrades quality
+# from "every URL gets an issue" to "Claude says this URL is worth an issue."
 
 on:
   schedule:
@@ -61,9 +71,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 bin/detector-research.py
+          # When no Anthropic API key is configured, fall back to legacy
+          # per-URL filing so the cron still produces visible issues. When
+          # the key IS set, Stage 1 writes the handoff file silently and
+          # Stage 2 takes over the filing role.
+          HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [[ "${HAS_ANTHROPIC_KEY}" == "true" ]]; then
+            echo "ANTHROPIC_API_KEY present — Stage 1 hands off to Stage 2."
+            python3 bin/detector-research.py
+          else
+            echo "ANTHROPIC_API_KEY not set — running Stage 1 in legacy file-per-URL mode."
+            python3 bin/detector-research.py --legacy-file-issues
+          fi
 
       - name: Stage 2 — detector-synthesize (Claude-judged candidates)
+        # Skip entirely when the API key isn't configured — Stage 1 already
+        # handled filing in legacy mode.
+        if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
