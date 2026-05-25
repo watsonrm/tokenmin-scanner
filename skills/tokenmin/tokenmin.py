@@ -2667,7 +2667,26 @@ def _uninstall(args: list[str]) -> int:
 
     # Build the plan. Each action returns (ok, detail).
     import shutil as _sh
+    import subprocess as _sp2
     plan: list[tuple[str, callable]] = []
+
+    # v0.12.7: Claude Code plugin removal goes FIRST. The plugin commands
+    # `claude plugin uninstall` and `claude plugin marketplace remove` read
+    # from `~/.tokenmin/.claude-plugin/` to identify what to remove; if the
+    # install dir is gone before we call them, they silently no-op and the
+    # marketplace registration survives. Then the next time the user types
+    # `tokenmin` inside Claude Code, the plugin trigger re-clones the
+    # bundle and the "uninstall" silently undoes itself.
+    if _sh.which("claude"):
+        try:
+            listed = _sp2.run(["claude", "plugin", "list"], capture_output=True, text=True, timeout=10)
+            if "tokenmin@tokenmin" in (listed.stdout or ""):
+                def _rm_plugin() -> tuple[bool, str]:
+                    ok = _uninstall_claude_plugin()
+                    return ok, "Claude Code plugin tokenmin@tokenmin"
+                plan.append(("Claude Code plugin tokenmin@tokenmin", _rm_plugin))
+        except (OSError, _sp2.TimeoutExpired):
+            pass
 
     if bin_link.is_symlink():
         target_str = ""
@@ -2718,20 +2737,6 @@ def _uninstall(args: list[str]) -> int:
                     return ok, f"PATH line removed from {_rc}"
                 plan.append((f"shell-rc PATH line in {rc}", _strip))
 
-    # Claude Code plugin — only add if it's actually registered.
-    import shutil as _sh2
-    import subprocess as _sp2
-    if _sh2.which("claude"):
-        try:
-            listed = _sp2.run(["claude", "plugin", "list"], capture_output=True, text=True, timeout=10)
-            if "tokenmin@tokenmin" in (listed.stdout or ""):
-                def _rm_plugin() -> tuple[bool, str]:
-                    ok = _uninstall_claude_plugin()
-                    return ok, "Claude Code plugin tokenmin@tokenmin"
-                plan.append(("Claude Code plugin tokenmin@tokenmin", _rm_plugin))
-        except (OSError, _sp2.TimeoutExpired):
-            pass
-
     if not plan:
         print(f"tokenmin{version_str}: nothing to uninstall (no install dir, symlink, PATH line, or plugin found)")
         return 0
@@ -2779,13 +2784,35 @@ def _uninstall(args: list[str]) -> int:
             failures.append(detail)
             print(f"  {c.YELLOW}!{c.RESET} {detail}", file=sys.stderr)
 
-    if failures:
-        print(
-            f"tokenmin{version_str} uninstalled with {len(failures)} warning(s) — "
-            f"rerun with -v for details",
-            file=sys.stderr,
-        )
-        return 1
+    # v0.12.7: post-run verification. If `claude plugin list` still shows
+    # any tokenmin entry, the bare-word "tokenmin" inside Claude Code will
+    # re-clone the bundle and silently re-install. Warn explicitly with the
+    # manual cleanup command — Rick hit this exact failure mode.
+    survived_warning = ""
+    if _sh.which("claude"):
+        try:
+            check = _sp2.run(["claude", "plugin", "list"], capture_output=True, text=True, timeout=10)
+            if "tokenmin" in (check.stdout or "").lower():
+                survived_warning = (
+                    f"  {c.YELLOW}!{c.RESET} Claude Code still has a tokenmin plugin registered.\n"
+                    f"    Typing `tokenmin` inside a Claude Code session may re-install.\n"
+                    f"    Clear it manually with:\n"
+                    f"      {c.CYAN}claude plugin uninstall tokenmin@tokenmin{c.RESET}\n"
+                    f"      {c.CYAN}claude plugin marketplace remove tokenmin{c.RESET}"
+                )
+        except (OSError, _sp2.TimeoutExpired):
+            pass
+
+    if failures or survived_warning:
+        if survived_warning:
+            print(survived_warning, file=sys.stderr)
+        if failures:
+            print(
+                f"tokenmin{version_str} uninstalled with {len(failures)} warning(s) — "
+                f"rerun with -v for details",
+                file=sys.stderr,
+            )
+            return 1
     print(f"tokenmin{version_str} uninstalled")
     return 0
 
