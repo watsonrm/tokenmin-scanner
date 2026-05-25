@@ -8,3 +8,4 @@ __pycache__/
 /.git-credentials
 /settings.json
 /last_run.json
+/.update-status

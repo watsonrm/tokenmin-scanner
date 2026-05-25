@@ -453,15 +453,29 @@ def _update_cmd(args: list[str]) -> int:
         return 0
 
     # Refuse if working tree is dirty.
+    # The install dir is a mirror, not a workspace — the only files that
+    # ever legitimately change here are tokenmin's own state files. Ignore
+    # those when judging "dirty" so a self-write between version-check and
+    # update doesn't self-block. Defensive: paired with the .gitignore entry
+    # for /.update-status, but kept here so installs that pull this fix in
+    # before re-cloning don't trip.
+    _SELF_STATE_FILES = {".update-status", ".last-update-check"}
     try:
         dirty = _sp.run(
             ["git", "-C", str(root), "status", "--porcelain"],
             capture_output=True, text=True, timeout=5,
         )
         if dirty.returncode == 0 and dirty.stdout.strip():
-            print(f"{c.YELLOW}!{c.RESET} working tree at {root} has local changes; refusing to update.", file=sys.stderr)
-            print(f"  inspect with `cd {root} && git status` and reset before retrying.", file=sys.stderr)
-            return 1
+            real_changes = []
+            for ln in dirty.stdout.splitlines():
+                # porcelain v1 lines are "XY <path>"; path starts at column 3.
+                path = ln[3:].strip() if len(ln) > 3 else ""
+                if path and path not in _SELF_STATE_FILES:
+                    real_changes.append(ln)
+            if real_changes:
+                print(f"{c.YELLOW}!{c.RESET} working tree at {root} has local changes; refusing to update.", file=sys.stderr)
+                print(f"  inspect with `cd {root} && git status` and reset before retrying.", file=sys.stderr)
+                return 1
     except (OSError, _sp.TimeoutExpired):
         pass
 
@@ -480,18 +494,34 @@ def _update_cmd(args: list[str]) -> int:
         except (OSError, _sp.TimeoutExpired):
             pass
 
-    print(f"  pulling {current_sha[:7]} → {latest_sha[:7]}...")
+    # Mirror-style update: fetch origin/main, then hard-reset to it. The
+    # install dir is by design a mirror, never a workspace, so a force-push
+    # upstream (e.g. release squashes) should not break the update flow the
+    # way `merge --ff-only` does.
     try:
-        pull = _sp.run(
-            ["git", "-C", str(root), "merge", "--ff-only", "--quiet", latest_sha],
+        fetch = _sp.run(
+            ["git", "-C", str(root), "fetch", "--quiet", "origin", "main"],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, _sp.TimeoutExpired) as exc:
-        print(f"{c.YELLOW}!{c.RESET} merge failed: {exc}", file=sys.stderr)
+        print(f"{c.YELLOW}!{c.RESET} fetch failed: {exc}", file=sys.stderr)
         return 1
-    if pull.returncode != 0:
-        print(f"{c.YELLOW}!{c.RESET} merge --ff-only failed:", file=sys.stderr)
-        print(pull.stderr or pull.stdout, file=sys.stderr)
+    if fetch.returncode != 0:
+        print(f"{c.YELLOW}!{c.RESET} fetch failed:", file=sys.stderr)
+        print(fetch.stderr or fetch.stdout, file=sys.stderr)
+        return 1
+
+    try:
+        reset = _sp.run(
+            ["git", "-C", str(root), "reset", "--hard", "--quiet", "FETCH_HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, _sp.TimeoutExpired) as exc:
+        print(f"{c.YELLOW}!{c.RESET} reset failed: {exc}", file=sys.stderr)
+        return 1
+    if reset.returncode != 0:
+        print(f"{c.YELLOW}!{c.RESET} reset failed:", file=sys.stderr)
+        print(reset.stderr or reset.stdout, file=sys.stderr)
         return 1
 
     # Reset the wrapper's 24h cooldown so it doesn't double-update next run.

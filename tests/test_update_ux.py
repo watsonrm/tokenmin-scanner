@@ -181,7 +181,7 @@ class UpdateCommandBehavior(unittest.TestCase):
         self.assertIn("TOKENMIN_AUTOUPDATE=off", err.getvalue())
 
     def test_check_flag_does_not_pull(self):
-        # --check should print status but never invoke `git merge`.
+        # --check should print status but never invoke `git merge` or `reset`.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".git").mkdir()
@@ -190,8 +190,8 @@ class UpdateCommandBehavior(unittest.TestCase):
                     return subprocess.CompletedProcess(cmd, 0, "newsha refs/heads/main\n", "")
                 if "show" in cmd:
                     return subprocess.CompletedProcess(cmd, 0, "0.99.0\n", "")
-                if "merge" in cmd:
-                    self.fail("--check must not invoke `git merge`")
+                if "merge" in cmd or "reset" in cmd:
+                    self.fail("--check must not invoke `git merge` or `git reset`")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
                  unittest.mock.patch.object(tokenmin, "_version_info",
@@ -200,6 +200,97 @@ class UpdateCommandBehavior(unittest.TestCase):
                  unittest.mock.patch.dict("os.environ", {}, clear=False):
                 rc = tokenmin._update_cmd(["--check"])
             self.assertEqual(rc, 0)
+
+    def test_self_state_files_do_not_block_update(self):
+        # Regression: prior to this fix, `tokenmin --version` wrote
+        # .update-status, which then made `git status --porcelain` non-empty,
+        # which then made `tokenmin update` refuse with "working tree has
+        # local changes". The cli self-blocked. .update-status (and
+        # .last-update-check) are tokenmin's own state files; they must
+        # never be treated as user dirty edits.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            ran = {"reset": False}
+            def fake_run(cmd, *a, **kw):
+                if "ls-remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "newsha000000000000000000000000000000000000 refs/heads/main\n", "")
+                if "show" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "0.99.0\n", "")
+                if "status" in cmd and "--porcelain" in cmd:
+                    # Mimic the real-world post-version-check state.
+                    return subprocess.CompletedProcess(cmd, 0, "?? .update-status\n", "")
+                if "fetch" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                if "reset" in cmd:
+                    ran["reset"] = True
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "0.1.0", "commit": "oldsha000000"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+                 unittest.mock.patch.dict("os.environ", {}, clear=False):
+                rc = tokenmin._update_cmd([])
+            self.assertEqual(rc, 0, "self-state files must not block update")
+            self.assertTrue(ran["reset"], "update must actually reset to origin/main")
+
+    def test_user_edits_still_block_update(self):
+        # Symmetry check: real user edits — anything other than the known
+        # self-state files — must still block. We don't want this fix to
+        # silently swallow legitimate local changes.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            def fake_run(cmd, *a, **kw):
+                if "ls-remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "newsha000000000000000000000000000000000000 refs/heads/main\n", "")
+                if "show" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "0.99.0\n", "")
+                if "status" in cmd and "--porcelain" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, " M skills/tokenmin/tokenmin.py\n", "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "0.1.0", "commit": "oldsha000000"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+                 unittest.mock.patch.dict("os.environ", {}, clear=False), \
+                 unittest.mock.patch.object(sys, "stderr", new_callable=__import__("io").StringIO):
+                rc = tokenmin._update_cmd([])
+            self.assertEqual(rc, 1, "real user edits must still block update")
+
+    def test_update_uses_fetch_reset_not_merge(self):
+        # Regression: upstream releases sometimes squash-and-force-push, which
+        # breaks `git merge --ff-only` on installs that pulled the pre-squash
+        # commits. The install dir is a mirror by design, so the update path
+        # must use `fetch + reset --hard FETCH_HEAD`, not `merge --ff-only`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            calls = []
+            def fake_run(cmd, *a, **kw):
+                calls.append(tuple(cmd) if isinstance(cmd, list) else cmd)
+                if "ls-remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "newsha000000000000000000000000000000000000 refs/heads/main\n", "")
+                if "show" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "0.99.0\n", "")
+                if "status" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                if "merge" in cmd:
+                    self.fail("update must not invoke `git merge` (force-push-fragile)")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with unittest.mock.patch.object(tokenmin, "_install_dir", return_value=root), \
+                 unittest.mock.patch.object(tokenmin, "_version_info",
+                                            return_value={"version": "0.1.0", "commit": "oldsha000000"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+                 unittest.mock.patch.dict("os.environ", {}, clear=False):
+                rc = tokenmin._update_cmd([])
+            self.assertEqual(rc, 0)
+            flat = [" ".join(c) for c in calls]
+            self.assertTrue(any("fetch" in c and "origin" in c and "main" in c for c in flat),
+                            "must fetch origin/main before resetting")
+            self.assertTrue(any("reset" in c and "--hard" in c and "FETCH_HEAD" in c for c in flat),
+                            "must reset --hard FETCH_HEAD (mirror semantics)")
 
 
 if __name__ == "__main__":
