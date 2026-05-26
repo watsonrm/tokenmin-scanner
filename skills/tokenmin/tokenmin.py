@@ -1730,8 +1730,61 @@ def _sparkline(values: list[float]) -> str:
     return "".join(out)
 
 
+def _watch_relaunch_in_window(args: list[str]) -> int:
+    """Re-launch `tokenmin watch <args>` in a new terminal window.
+
+    `tokenmin watch` is a curses-style TUI that needs a real TTY to render —
+    when invoked from an agent, hook, or CI context, stdout is a pipe and
+    the dashboard would just dump escape codes to a log. On macOS we spawn
+    a fresh Terminal.app window via osascript so the dashboard renders for
+    the user; elsewhere we print a clear "run this in your terminal" hint.
+    """
+    import platform as _plat
+    import shlex
+    import subprocess
+
+    cmd_parts = ["tokenmin", "watch", *args]
+    cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
+
+    if _plat.system() == "Darwin":
+        # AppleScript string-escape: backslash first, then double-quote.
+        safe = cmd_str.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            'tell application "Terminal"\n'
+            '  activate\n'
+            f'  do script "{safe}"\n'
+            'end tell'
+        )
+        try:
+            subprocess.run(["osascript", "-e", script], check=True)
+            print(
+                f"tokenmin watch: launched in a new Terminal window  ({cmd_str})",
+                file=sys.stderr,
+            )
+            return 0
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(
+                f"tokenmin watch: couldn't open a Terminal window ({e}).\n"
+                f"  Run this in your terminal:\n    {cmd_str}",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(
+        f"tokenmin watch: this is a live TUI and needs a real terminal.\n"
+        f"  Run this in your terminal:\n    {cmd_str}",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _watch(args: list[str]) -> int:
     """Live dashboard. Polls ~/.claude every poll_interval seconds and refreshes."""
+    # If stdout isn't a TTY, the curses-style redraws won't render — re-launch
+    # in a real terminal window so the dashboard is actually visible.
+    if not sys.stdout.isatty():
+        return _watch_relaunch_in_window(args)
+
     import argparse as _ap
     from collections import deque
     sp = _ap.ArgumentParser(prog="tokenmin watch", description="Live token-spend dashboard.")
