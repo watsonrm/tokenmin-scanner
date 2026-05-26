@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate a synthetic ~/.claude tree and run CLIP against it to produce
-clip/sample_output.md. Lets reviewers see the report shape without running
+"""Generate a synthetic ~/.claude tree and run tokenmin against it to produce
+engine/sample_output.md. Lets reviewers see the report shape without running
 against real data. Throwaway helper — not part of the product surface.
 
 SPDX-License-Identifier: Apache-2.0"""
@@ -129,7 +129,7 @@ def main() -> int:
         home = Path(td) / ".claude"
         build_synthetic(home)
         out = Path(__file__).parent / "sample_output.md"
-        cmd = [sys.executable, str(Path(__file__).parent / "clip.py"),
+        cmd = [sys.executable, str(Path(__file__).parent.parent / "skills" / "tokenmin" / "tokenmin.py"),
                "--claude-home", str(home),
                "--days", "30",
                "--out", str(out)]

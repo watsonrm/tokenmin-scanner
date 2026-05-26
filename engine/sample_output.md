@@ -1,4 +1,4 @@
-# Your Claude Improvement Plan (CLIP)
+# Your Claude Improvement Plan
 
 _Generated 2026-05-22 08:47 UTC · 30-day window · anonymized — no paths, names, secrets, or message content._
 
@@ -134,7 +134,7 @@ Source: https://code.claude.com/docs/en/best-practices.md
 
 ## Sources & attribution
 
-CLIP applies the **RMW Claude Code Workflow Optimizer** ([github.com/watsonrm/rmwcommerce](https://github.com/watsonrm/rmwcommerce/blob/main/claude-code-optimizer.md)) to your local usage data. The optimizer's prescriptions come from Anthropic's official documentation and public talks by Boris Cherny (creator and head of Claude Code at Anthropic).
+Tokenmin applies the **RMW Claude Code Workflow Optimizer** ([github.com/watsonrm/rmwcommerce](https://github.com/watsonrm/rmwcommerce/blob/main/claude-code-optimizer.md)) to your local usage data. The optimizer's prescriptions come from Anthropic's official documentation and public talks by Boris Cherny (creator and head of Claude Code at Anthropic).
 
 - Claude Code best practices — https://code.claude.com/docs/en/best-practices.md
 - CLAUDE.md / memory — https://code.claude.com/docs/en/memory.md
