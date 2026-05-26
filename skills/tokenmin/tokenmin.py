@@ -1268,8 +1268,10 @@ def _render_terminal(result: dict) -> None:
         proj_summary = "  ·  ".join(f"{_project_display_name(name)} ({n})" for name, n in proj_scan)
         print(f"  top projects: {c.DIM}{proj_summary}{c.RESET}")
     if subscription:
-        # Don't show a dollar number — Pro/Max users pay flat. Show plan instead.
-        print(f"  plan: {c.BOLD}{plan}{c.RESET} {c.DIM}(flat-fee; savings reported as quota stretch){c.RESET}")
+        # Pro/Max are flat-fee; we don't have a real denominator for "quota
+        # stretch" (Anthropic doesn't publish the underlying token limits),
+        # so we don't pretend. Severity + effort + confidence carry the rank.
+        print(f"  plan: {c.BOLD}{plan}{c.RESET} {c.DIM}(flat-fee; fixes ranked by severity, not $){c.RESET}")
     else:
         plan_tag = f" {c.DIM}(plan: {plan}){c.RESET}" if plan != "unknown" else (
             f" {c.DIM}— set with `tokenmin plan api|pro|max`{c.RESET}"
@@ -1339,8 +1341,19 @@ def _render_terminal(result: dict) -> None:
         for f in findings
     )
     if subscription:
-        total_unit = _fmt_quota_pct(discounted_total, monthly_api)
-        print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  {c.BOLD}{total_unit}{c.RESET} stretch across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
+        # v0.12.12: no $-unit, no fake quota-stretch. Count + effort + the
+        # severity histogram of the findings carries the message.
+        sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for f in findings:
+            disc, _ = _discounted_savings(
+                float(f.get("savings_usd_per_month", 0)),
+                float(f.get("confidence", 0)),
+            )
+            _, _, label = _severity(disc)
+            sev_counts[label] = sev_counts.get(label, 0) + 1
+        sev_chunks = [f"{n} {k}" for k, n in sev_counts.items() if n > 0]
+        sev_summary = ", ".join(sev_chunks) if sev_chunks else "none"
+        print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  {c.BOLD}{len(findings)} fix(es){c.RESET}  {c.DIM}({sev_summary}){c.RESET}  ·  ~{total_eff:.1f} hrs total")
     else:
         print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(discounted_total)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
     print()
@@ -1376,7 +1389,11 @@ def _render_terminal(result: dict) -> None:
             # Low-confidence finding: don't put a dollar number on the headline.
             save_unit = f"{c.DIM}(low conf — see drill-down){c.RESET}"
         elif subscription:
-            save_unit = _fmt_quota_pct(disc_save, monthly_api)
+            # v0.12.12: severity label instead of fake quota %. The pill
+            # stars + bar already encode rank visually; the label names the
+            # tier ("high" / "medium" / "low") in words.
+            _, _, sev_label = _severity(disc_save)
+            save_unit = sev_label
         else:
             save_unit = f"{_fmt_money(disc_save)}/mo"
 
@@ -1447,8 +1464,14 @@ def _render_show(finding_id: str, apply: bool = False) -> int:
         print(f"  {c.DIM}hidden from the main audit because each is below the per-plan threshold.{c.RESET}", file=sys.stderr)
         print(file=sys.stderr)
         for f in low:
-            save = f["savings_usd_per_month"]
-            unit = _fmt_quota_pct(save, monthly_api) if subscription else f"{_fmt_money(save)}/mo"
+            save = float(f.get("savings_usd_per_month", 0))
+            conf = float(f.get("confidence", 0))
+            disc, _ = _discounted_savings(save, conf)
+            if subscription:
+                _, _, sev_label = _severity(disc)
+                unit = sev_label
+            else:
+                unit = f"{_fmt_money(disc)}/mo"
             print(f"  - {c.BOLD}{_strip_ctl(f['id'])}{c.RESET}  {c.DIM}{unit} · {_strip_ctl(f['title'])}{c.RESET}", file=sys.stderr)
         print(file=sys.stderr)
         print(f"  drill into one: {c.CYAN}tokenmin show <id>{c.RESET}", file=sys.stderr)
@@ -1485,7 +1508,13 @@ def _render_show(finding_id: str, apply: bool = False) -> int:
     if hide_dollar:
         impact_line = f"{c.DIM}low confidence ({conf}%) — number suppressed; engine estimate ~{_fmt_money(raw_save)}/mo{c.RESET}"
     elif subscription:
-        impact_line = f"{c.BOLD}{_fmt_quota_pct(disc_save, monthly_api)}{c.RESET} stretch on your flat-fee plan"
+        # v0.12.12: drop fake quota %. Show the severity label + the engine's
+        # raw $ estimate as context (API users would pay this; you don't).
+        _, _, sev_label = _severity(disc_save)
+        impact_line = (
+            f"{c.BOLD}{sev_label}{c.RESET} severity on your flat-fee plan  "
+            f"{c.DIM}(if you were on API: ~{_fmt_money(disc_save)}/mo recoverable){c.RESET}"
+        )
     else:
         impact_line = f"{c.BOLD}{_fmt_money(disc_save)}/mo{c.RESET} estimated savings  {c.DIM}(engine estimate ~{_fmt_money(raw_save)}/mo × {conf}% conf){c.RESET}"
 
