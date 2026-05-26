@@ -102,6 +102,32 @@ class MCPZombieServers(unittest.TestCase):
         r = analyze_structured(snap)
         self.assertNotIn("mcp_zombie_servers", _ids(r["findings"]))
 
+    def test_silent_when_only_desktop_servers_configured(self):
+        # Regression for the 2026-05-25 qmd false-positive incident.
+        # Same-surface rule (DETECTOR_RULES.md): Desktop-only servers must
+        # NOT be flagged against Code session evidence. Code never loaded
+        # their schema, so there's nothing to recover.
+        snap = _base_snapshot(n_sessions=20, tool_calls={"Bash": 5})
+        snap["config"] = {
+            "mcp_servers": [],
+            "mcp_servers_desktop_only": ["qmd"],
+        }
+        r = analyze_structured(snap)
+        self.assertNotIn("mcp_zombie_servers", _ids(r["findings"]),
+                         "Desktop-only servers must not be judged against Code session data")
+
+    def test_fires_on_code_server_when_desktop_also_present(self):
+        # Symmetry check: a legit Code zombie should still fire even when a
+        # separate Desktop-only entry exists. The fix must not over-suppress.
+        snap = _base_snapshot(n_sessions=20, tool_calls={"Bash": 5})
+        snap["config"] = {
+            "mcp_servers": ["github"],
+            "mcp_servers_desktop_only": ["qmd"],
+        }
+        r = analyze_structured(snap)
+        self.assertIn("mcp_zombie_servers", _ids(r["findings"]),
+                      "Code-loaded zombie must still fire even with Desktop entries present")
+
 
 class ParallelToolsUnderused(unittest.TestCase):
     def test_fires_on_sequential_pattern(self):

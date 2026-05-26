@@ -99,6 +99,18 @@ class ConfigSnapshot:
     custom_skills: list[str] = field(default_factory=list)
     custom_commands: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
+    # Desktop-only MCP servers — configured in Claude Desktop's config but NOT
+    # loaded by Claude Code. Stored separately so detectors that judge
+    # "configured but unused" against Code session evidence don't false-positive
+    # on a server Code never had access to. See DETECTOR_RULES.md (rule:
+    # same-surface comparison).
+    mcp_servers_desktop_only: list[str] = field(default_factory=list)
+    # Per-server invocation count derived from session tool_calls. Populated
+    # by _label_scrub_pass BEFORE tool names get hashed (the hash of
+    # `mcp__SERVER__call` and `SERVER` are unrelated, so prefix matching on
+    # anonymized names fails — detectors must consult this map instead).
+    # Keys match the (post-scrub) entries in `mcp_servers`.
+    mcp_server_invocations: dict[str, int] = field(default_factory=dict)
     projects_with_claude_md: int = 0
     projects_with_oversized_claude_md: int = 0
     projects_total: int = 0
@@ -539,9 +551,47 @@ def scan_config(claude_home: Path) -> ConfigSnapshot:
     if commands_dir.is_dir():
         snap.custom_commands = sorted(p.stem for p in commands_dir.glob("*.md"))
 
-    # MCP config — try a few known locations
+    # MCP config — separated by surface so "unused" findings only judge
+    # against the surface tokenmin actually scans (Code session history under
+    # ~/.claude/projects/). See DETECTOR_RULES.md, rule: same-surface comparison.
+    #
+    # Code (Claude Code): mcpServers live in ~/.claude.json — top-level for
+    #   user-wide servers, and `projects.<path>.mcpServers` for per-project
+    #   overrides. Take the union of both.
+    # Code (legacy): ~/.claude/mcp.json (rarely used, kept for back-compat).
+    # Desktop (Claude Desktop): claude_desktop_config.json in either
+    #   ~/.claude/ or ~/Library/Application Support/Claude/. NEVER mixed
+    #   into mcp_servers — routed to mcp_servers_desktop_only so detectors
+    #   that compare against Code session evidence ignore it.
+    code_servers: set[str] = set()
+
+    legacy_mcp = claude_home / "mcp.json"
+    if legacy_mcp.exists():
+        data = _safe_json(legacy_mcp) or {}
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+        if isinstance(servers, dict):
+            code_servers.update(servers.keys())
+
+    code_config = Path.home() / ".claude.json"
+    if code_config.exists():
+        data = _safe_json(code_config) or {}
+        if isinstance(data, dict):
+            top = data.get("mcpServers")
+            if isinstance(top, dict):
+                code_servers.update(top.keys())
+            projects = data.get("projects")
+            if isinstance(projects, dict):
+                for proj_cfg in projects.values():
+                    if not isinstance(proj_cfg, dict):
+                        continue
+                    proj_servers = proj_cfg.get("mcpServers")
+                    if isinstance(proj_servers, dict):
+                        code_servers.update(proj_servers.keys())
+
+    snap.mcp_servers = sorted(code_servers)
+
+    desktop_only: set[str] = set()
     for cand in [
-        claude_home / "mcp.json",
         claude_home / "claude_desktop_config.json",
         Path.home() / "Library/Application Support/Claude/claude_desktop_config.json",
     ]:
@@ -549,8 +599,11 @@ def scan_config(claude_home: Path) -> ConfigSnapshot:
             data = _safe_json(cand) or {}
             servers = data.get("mcpServers") if isinstance(data, dict) else None
             if isinstance(servers, dict):
-                snap.mcp_servers = sorted(servers.keys())
-                break
+                # Exclude any server also loaded by Code — that one is not
+                # "desktop-only" and would double-count.
+                desktop_only.update(set(servers.keys()) - code_servers)
+
+    snap.mcp_servers_desktop_only = sorted(desktop_only)
 
     # projects
     projects_dir = claude_home / "projects"

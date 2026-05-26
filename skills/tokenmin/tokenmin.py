@@ -135,9 +135,51 @@ def _label_scrub_pass(snapshot: dict) -> dict:
       - sessions[*].project       (Claude Code project dir name)
       - sessions[*].agents_used   (custom subagent_type names)
       - sessions[*].tool_calls    (mcp__* tool names reveal integrated services)
-      - config.mcp_servers
+      - config.mcp_servers (Code-loaded) + config.mcp_servers_desktop_only
       - config.custom_agents, custom_skills, custom_commands
+
+    Also pre-computes config.mcp_server_invocations BEFORE hashing tool_calls.
+    Detectors that need to compare "is server X configured but unused?" can't
+    do prefix matching on hashed tool names — the hash of `mcp__X__call` and
+    the hash of `X` are unrelated. So we walk the raw names here, build a
+    {server_name: total_invocations} map, then hash the keys with the same
+    scrub_label call the mcp_servers list uses, so the detector sees a
+    consistent set of identifiers.
     """
+    # Pre-compute MCP server invocation counts. Must happen BEFORE tool_calls
+    # get hashed below (otherwise the `mcp__SERVER__tool` → SERVER extraction
+    # has nothing to work with).
+    cfg_pre = snapshot.get("config") or {}
+    if isinstance(cfg_pre, dict):
+        configured = list((cfg_pre.get("mcp_servers") or []))
+        # If we know the configured server list, count exactly those. If we
+        # don't (snapshot from an older client), fall back to scanning all
+        # mcp__*__ tool prefixes in tool_calls. Either way the keys we emit
+        # are raw server names, which the scrub pass below will hash.
+        invocations: dict[str, int] = {}
+        for s in snapshot.get("sessions") or []:
+            if not isinstance(s, dict):
+                continue
+            tc = s.get("tool_calls") or {}
+            if not isinstance(tc, dict):
+                continue
+            for name, n in tc.items():
+                if not isinstance(name, str) or not name.startswith("mcp__"):
+                    continue
+                # Tool names follow `mcp__<server>__<tool>`. Server may itself
+                # contain underscores so split on `__` then rejoin all-but-last.
+                parts = name[len("mcp__"):].split("__")
+                if len(parts) < 2:
+                    continue
+                server = "__".join(parts[:-1])
+                if configured and server not in configured:
+                    continue  # bound to declared servers when possible
+                invocations[server] = invocations.get(server, 0) + (n if isinstance(n, int) else 0)
+        # Backfill zero entries for configured servers that never fired.
+        for srv in configured:
+            invocations.setdefault(srv, 0)
+        cfg_pre["mcp_server_invocations"] = invocations
+
     for s in snapshot.get("sessions") or []:
         if isinstance(s, dict):
             if s.get("project"):
@@ -165,10 +207,20 @@ def _label_scrub_pass(snapshot: dict) -> dict:
                 s["files_written"] = [scrub_path(x) for x in fw if isinstance(x, str)]
     cfg = snapshot.get("config") or {}
     if isinstance(cfg, dict):
-        for key in ("mcp_servers", "custom_agents", "custom_skills", "custom_commands"):
+        for key in ("mcp_servers", "mcp_servers_desktop_only",
+                    "custom_agents", "custom_skills", "custom_commands"):
             v = cfg.get(key) or []
             if isinstance(v, list):
                 cfg[key] = [scrub_label(x) if isinstance(x, str) else x for x in v]
+        # mcp_server_invocations keys are raw server names from the pre-pass
+        # above. Hash them with the same scrub_label call so they match what
+        # mcp_servers gets above — detectors do a name-equality check.
+        inv = cfg.get("mcp_server_invocations")
+        if isinstance(inv, dict):
+            cfg["mcp_server_invocations"] = {
+                (scrub_label(k) if isinstance(k, str) else k): v
+                for k, v in inv.items()
+            }
     return snapshot
 
 

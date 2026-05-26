@@ -843,20 +843,31 @@ def detect_mcp_zombie_servers(snap: Snapshot) -> Finding | None:
     Each idle MCP server still injects its tool schema into context on every
     turn. The behavioral question — "have you fired a tool from this server
     in N days?" — is the right audit, not "do I need this server in theory?"
+
+    Same-surface rule (see DETECTOR_RULES.md): this detector compares
+    Code-loaded MCP servers (snap.config.mcp_servers) against Code session
+    invocations. Desktop-only servers live in mcp_servers_desktop_only and
+    are intentionally excluded — Code never loads them, so they can't be
+    "zombie" from Code's perspective.
     """
     servers = snap.config.mcp_servers or []
     if not servers:
         return None
-    # Aggregate tool calls across all sessions.
-    all_calls: Counter = Counter()
-    for s in snap.sessions:
-        all_calls.update(s.tool_calls)
-    zombies: list[str] = []
-    for server in servers:
-        prefix = f"mcp__{server}__"
-        invocations = sum(n for name, n in all_calls.items() if name.startswith(prefix))
-        if invocations == 0:
-            zombies.append(server)
+    # Use precomputed invocation counts. The map is built BEFORE anonymization
+    # (see _label_scrub_pass in skills/tokenmin/tokenmin.py) — direct prefix
+    # matching on `tool_calls` here would always miss, because the tool-name
+    # hash and the server-name hash are unrelated.
+    inv = snap.config.mcp_server_invocations or {}
+    # Back-compat fallback for snapshots from clients that don't ship the map.
+    if not inv:
+        all_calls: Counter = Counter()
+        for s in snap.sessions:
+            all_calls.update(s.tool_calls)
+        inv = {}
+        for server in servers:
+            prefix = f"mcp__{server}__"
+            inv[server] = sum(n for name, n in all_calls.items() if name.startswith(prefix))
+    zombies = [server for server in servers if inv.get(server, 0) == 0]
     if not zombies:
         return None
     if len(snap.sessions) < 10:
@@ -883,11 +894,18 @@ def detect_mcp_zombie_servers(snap: Snapshot) -> Finding | None:
         confidence=0.85,
         how_to_fix=(
             "Two options:\n\n"
-            "- **Remove the server** from `~/.claude/settings.json` (or "
-            "wherever you configured it). One line of JSON.\n"
+            "- **Remove the server** from your Claude Code MCP config — "
+            "either `~/.claude.json` (top-level `mcpServers`, or "
+            "`projects.<path>.mcpServers` for a per-project entry) or the "
+            "legacy `~/.claude/mcp.json`. One line of JSON.\n"
             "- **Keep it but defer-load**: set `ENABLE_TOOL_SEARCH=auto` in "
             "your env so Claude only loads schemas when relevant. Most useful "
             "when you have many MCP servers and use each occasionally.\n\n"
+            "Note: if you call the same tool as a CLI from Bash (e.g. "
+            "`qmd query ...` instead of via MCP), it'll show as zombie here "
+            "even though the binary is in use. The schema cost is real "
+            "regardless — your bash calls are free, the MCP schema injection "
+            "isn't.\n\n"
             "Audit by behavior, not by intent: \"have I fired a tool from this "
             "server in the last 30 days?\" is the question.\n"
         ),

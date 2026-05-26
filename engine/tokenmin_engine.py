@@ -75,6 +75,8 @@ def _config_from_dict(d: dict) -> ConfigSnapshot:
         custom_skills=list(d.get("custom_skills") or []),
         custom_commands=list(d.get("custom_commands") or []),
         mcp_servers=list(d.get("mcp_servers") or []),
+        mcp_servers_desktop_only=list(d.get("mcp_servers_desktop_only") or []),
+        mcp_server_invocations=dict(d.get("mcp_server_invocations") or {}),
         projects_with_claude_md=d.get("projects_with_claude_md", 0),
         projects_with_oversized_claude_md=d.get("projects_with_oversized_claude_md", 0),
         projects_total=d.get("projects_total", 0),
