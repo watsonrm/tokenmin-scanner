@@ -359,5 +359,74 @@ class AllElevenRegistered(unittest.TestCase):
         self.assertFalse(missing, f"v0.12.6 detectors missing from registry: {missing}")
 
 
+class ModelOverspendContextAware(unittest.TestCase):
+    """v0.12.8 (scanner#9): model_overspend must downgrade confidence when the
+    user has clearly done subagent routing already. Otherwise the recommendation
+    to switch to Sonnet fires at $$$$ critical for users whose subagent layer
+    is already carrying the cheap-tier work — wrong by default."""
+
+    @staticmethod
+    def _opus_heavy(agent_calls: int) -> dict:
+        per_session = agent_calls // 20 if agent_calls else 0
+        return _base_snapshot(
+            n_sessions=20,
+            tool_calls={"Bash": 5},
+            agents_used=({"researcher": per_session} if per_session else {}),
+            models_used={"claude-opus-4-7": 30},
+            assistant_turns=30,
+            user_turns=30,
+            input_tokens=200_000,
+            cache_write_tokens=50_000,
+            cache_read_tokens=500_000,
+            est_cost_usd=50.0,
+        )
+
+    def test_downgrades_confidence_when_subagent_routing_is_heavy(self):
+        # 300 / 20 = 15 calls per session → 300 total > 100 threshold
+        snap = self._opus_heavy(agent_calls=300)
+        r = analyze_structured(snap)
+        overspend = next((f for f in r["findings"] if f["id"] == "model_overspend"), None)
+        self.assertIsNotNone(overspend, "model_overspend should still fire (informational)")
+        self.assertLessEqual(overspend["confidence"], 0.25,
+            "with heavy subagent volume, model_overspend confidence must drop "
+            "(otherwise it ranks #1 for users who already did the routing work)")
+        self.assertIn("subagent", overspend["title"].lower())
+
+    def test_keeps_full_confidence_without_subagent_routing(self):
+        snap = self._opus_heavy(agent_calls=0)
+        r = analyze_structured(snap)
+        overspend = next((f for f in r["findings"] if f["id"] == "model_overspend"), None)
+        self.assertIsNotNone(overspend)
+        self.assertGreaterEqual(overspend["confidence"], 0.5,
+            "without subagent activity, model_overspend should fire at full confidence")
+
+
+class WellRoutedSubagents(unittest.TestCase):
+    """v0.12.8: positive informational finding that fires when the user has
+    clearly done subagent routing. Counterbalances model_overspend."""
+
+    def test_fires_with_heavy_agent_volume_and_custom_agents(self):
+        import shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            agent_file = Path(tmp) / "researcher.md"
+            agent_file.write_text("---\nname: r\nmodel: haiku\n---\n")
+            snap = ModelOverspendContextAware._opus_heavy(300)
+            snap["config"] = {"custom_agents": [str(agent_file)]}
+            r = analyze_structured(snap)
+            wrs = next((f for f in r["findings"] if f["id"] == "well_routed_subagents"), None)
+            self.assertIsNotNone(wrs,
+                "well_routed_subagents should fire when subagent routing is clearly intentional")
+            self.assertEqual(wrs["savings_usd_per_month"], 0.0,
+                "informational finding has zero dollar savings")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_silent_without_subagent_activity(self):
+        snap = ModelOverspendContextAware._opus_heavy(10)
+        r = analyze_structured(snap)
+        self.assertNotIn("well_routed_subagents", _ids(r["findings"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

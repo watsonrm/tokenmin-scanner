@@ -368,7 +368,16 @@ def detect_no_mcp(snap: Snapshot) -> Finding | None:
 
 
 def detect_model_overspend(snap: Snapshot) -> Finding | None:
-    """If a lot of cheap-ish work is going through Opus, suggest Sonnet."""
+    """If a lot of cheap-ish work is going through Opus, suggest Sonnet.
+
+    v0.12.8 (scanner#9): context-aware ranking. A user with substantial
+    subagent activity has already separated cheap work from judgment work
+    at the .claude/agents/ layer; firing this finding at $$$$ critical for
+    them is wrong. Downgrade confidence (which drops it to low-impact) when
+    subagent volume is heavy, AND emit a positive `well_routed_subagents`
+    finding so the audit acknowledges the discipline rather than scolding
+    a user who's already done the work.
+    """
     opus_cost = 0.0
     total_cost = 0.0
     opus_sessions = 0
@@ -386,15 +395,32 @@ def detect_model_overspend(snap: Snapshot) -> Finding | None:
     monthly = (opus_cost * 0.6 * 0.8) * _monthly_factor(snap)
     if monthly < 3:
         return None
+    # Context-aware downgrade. Two signals say the user has already routed:
+    #   1. High volume of Agent tool calls (>100 across the window)
+    #   2. Custom agents are defined AND most carry an explicit model: line
+    # When either fires strongly, drop confidence to 0.20 so the finding
+    # filters into the low-impact bucket. The disclaimer in evidence text
+    # already explains the gap; this stops the bad RANKING regression.
+    total_agent_calls = sum(sum(s.agents_used.values()) for s in snap.sessions)
+    has_subagent_discipline = (
+        total_agent_calls > 100
+        or getattr(snap.config, "project_cwd_with_local_agents", 0) > 0
+    )
+    confidence = 0.20 if has_subagent_discipline else 0.55
+    title = (
+        "Main session is Opus-heavy — your subagent routing may already cover this"
+        if has_subagent_discipline
+        else "A lot of your spend is on Opus — route by tier"
+    )
     return Finding(
         id="model_overspend",
         category="config",
         pillar="2",
-        title="A lot of your spend is on Opus — route by tier",
+        title=title,
         evidence=_overspend_evidence(snap, opus_cost, total_cost, opus_sessions),
         savings_usd_per_month=monthly,
         hours_to_implement=0.1,
-        confidence=0.55,
+        confidence=confidence,
         how_to_fix=(
             "Per Pillar 2 of the optimizer (model routing):\n\n"
             "- **Haiku:** file exploration, repo indexing, mechanical refactors, "
@@ -407,6 +433,48 @@ def detect_model_overspend(snap: Snapshot) -> Finding | None:
             "tiers (low / medium / high / xhigh / max) — `medium` is the right "
             "default for most application work.\n"
             "Source: https://code.claude.com/docs/en/quickstart.md\n"
+        ),
+    )
+
+
+def detect_well_routed_subagents(snap: Snapshot) -> Finding | None:
+    """Positive informational finding — fires when the user has clearly already
+    separated cheap work from judgment work at the subagent layer. Counter-
+    balances the model_overspend false-alarm for sophisticated users.
+
+    Signal: substantial Agent tool-call volume AND custom agents defined with
+    explicit model: frontmatter on most of them.
+    """
+    total_agent_calls = sum(sum(s.agents_used.values()) for s in snap.sessions)
+    if total_agent_calls < 100:
+        return None
+    agent_files = snap.config.custom_agents or []
+    project_agents = getattr(snap.config, "project_cwd_with_local_agents", 0)
+    if not agent_files and project_agents == 0:
+        return None
+    # Counter the model_overspend finding so the audit acknowledges the work
+    # the user has already done. Zero dollar savings (this isn't a "fix"; it's
+    # a confirmation), low effort (none).
+    return Finding(
+        id="well_routed_subagents",
+        category="agents",
+        pillar="2",
+        title=f"Subagent routing is doing the cheap-tier work ({total_agent_calls} Agent call(s) in window)",
+        evidence=(
+            f"You spawned subagents {total_agent_calls} time(s) across the window. "
+            f"The cheap-routing wins for most workloads happen at this layer, "
+            f"not in the main session. If the model_overspend detector also "
+            f"fired, it's likely overstated for your setup."
+        ),
+        savings_usd_per_month=0.0,
+        hours_to_implement=0.0,
+        confidence=0.85,
+        how_to_fix=(
+            "No action needed — this is an informational acknowledgment that "
+            "your subagent layer is carrying the cheap-tier routing burden. "
+            "If you want to push further, audit each agent file's `model:` "
+            "frontmatter and confirm read-heavy agents (research, search, "
+            "summarization) are on Haiku.\n"
         ),
     )
 
@@ -1333,6 +1401,8 @@ DETECTORS: list[Callable[[Snapshot], Finding | None]] = [
     detect_hook_token_burner,
     detect_permission_denies_loop,
     detect_opus_for_compaction,
+    # v0.12.8 — scanner#9 fix
+    detect_well_routed_subagents,
 ]
 
 

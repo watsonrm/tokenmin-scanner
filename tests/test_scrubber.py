@@ -229,11 +229,26 @@ class PropertyTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
-    """CLI behaviors. Uses the fixed test salt for deterministic --selfcheck output."""
+    """CLI behaviors. Uses the fixed test salt for deterministic --selfcheck output.
+
+    Each CLI invocation runs against a fresh sandbox HOME so the test suite
+    never writes audit.log / last_run.json / .salt into the real
+    ~/.tokenmin directory. Earlier versions of this class leaked real HOME
+    via os.environ inheritance — running `bash tests/run.sh` would silently
+    create or update files in the developer's actual install.
+    """
+
+    def setUp(self):
+        self._sandbox_home = tempfile.mkdtemp(prefix="tokenmin-cli-test-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._sandbox_home, ignore_errors=True)
 
     def _run(self, *args, expect_ok=True, env_extra=None):
         env = dict(
             os.environ,
+            HOME=self._sandbox_home,  # isolate audit log + last_run + .salt
             TOKENMIN_SALT_PATH=str(TEST_SALT),
             TOKENMIN_AUTOUPDATE="off",
         )
