@@ -112,4 +112,14 @@ jobs:
           git config user.email "tokenmin-research@users.noreply.github.com"
           git add bin/.research-seen.json bin/.research-fresh.json
           git commit -m "research: update seen + fresh state ($(date -u +%Y-%m-%d))"
-          git push
+          # Stage 2 can take minutes; main may have moved during the run.
+          # Rebase + retry to survive a push race.
+          for attempt in 1 2 3; do
+            if git pull --rebase --quiet origin main && git push origin main; then
+              echo "state committed (attempt ${attempt})"
+              exit 0
+            fi
+            echo "push race (attempt ${attempt}), retrying..."
+            sleep 5
+          done
+          echo "::warning::state push lost the race 3 times — state will be re-derived next run"
