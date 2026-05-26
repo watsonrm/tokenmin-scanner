@@ -888,12 +888,12 @@ def main(argv: list[str] | None = None) -> int:
     # First-run telemetry consent (no-op when already decided, or non-interactive).
     # Never asks for runs that won't produce findings.
     _maybe_telemetry_consent()
-    # First-run billing plan consent — lets the report frame savings as quota
-    # stretch instead of dollar savings for flat-fee Pro/Max users.
-    _maybe_billing_plan_consent()
     # If pricing.json is older than its stale threshold, warn ONCE so users
     # know dollar numbers may not match Anthropic's current published rates.
     _maybe_stale_pricing_warning()
+    # v0.12.9: billing-plan consent moved to AFTER the snapshot is built so the
+    # prompt can lead with a usage-based suggestion. See post-snapshot block
+    # in the structured-engine branch.
 
     # Resolve --days. Accept "auto" (default) or an integer string. For code
     # source, peek at session count to auto-scale the window.
@@ -1000,14 +1000,27 @@ def main(argv: list[str] | None = None) -> int:
     structured_engine = _local_engine_structured()
     if structured_engine is not None:
         _progress("analyzing", done=False)
-        # Pass the billing plan so the report frames savings in the right unit
-        # (dollar savings on API; % quota stretch on flat-fee Pro/Max).
+        # v0.12.9: do a first-pass analysis with current plan setting (possibly
+        # 'unknown'), then prompt the user with a snapshot-aware suggestion if
+        # plan is still unknown. The prompt has a default derived from the
+        # snapshot, so the user usually just hits Enter. If they pick a real
+        # plan, re-analyze with it so the rendered audit uses the correct unit.
         try:
             result = structured_engine(snapshot, billing_plan=_billing_plan())
         except TypeError:
             # Pre-0.5 engine without billing_plan kwarg.
             result = structured_engine(snapshot)
         _progress("analyzed", done=True)
+        # Snapshot-aware billing-plan consent. Only does anything if plan is
+        # still 'unknown' AND stdin/stderr are ttys. No-op otherwise.
+        _maybe_billing_plan_consent(result)
+        # If the prompt updated the plan, re-render with the new framing.
+        new_plan = _billing_plan()
+        if new_plan != result.get("billing_plan") and new_plan != "unknown":
+            try:
+                result = structured_engine(snapshot, billing_plan=new_plan)
+            except TypeError:
+                result = structured_engine(snapshot)
         _save_last_run(result)
 
         # Output mode: file = markdown; otherwise = rich inline.
@@ -2509,13 +2522,69 @@ def _billing_plan() -> str:
     return plan if plan in _VALID_PLANS else "unknown"
 
 
-def _maybe_billing_plan_consent() -> None:
+def _suggest_billing_plan(snapshot_dict: dict | None) -> tuple[str, float, str]:
+    """Heuristic plan inference from a structured engine snapshot.
+
+    Returns (suggested_plan, confidence, reason_string). Confidence is 0..1.
+
+    Signals (in order of weight):
+      1. ANTHROPIC_API_KEY in env that's been used to authenticate Claude Code
+         (env-only check — strong signal of API usage)
+      2. Rate-limit error volume (none = API or Max; some = Pro; lots = Pro hitting cap)
+      3. Total API-equivalent monthly cost (>$100 with no rate limits = Max;
+         very low with diverse models = API)
+      4. Opus presence in model mix (Pro allows some; Max sustains heavy use)
+
+    Returns ("unknown", 0.0, "") when signals are too ambiguous to suggest.
+    """
+    if not snapshot_dict:
+        return ("unknown", 0.0, "")
+    snap = snapshot_dict.get("snapshot") or {}
+    sessions = snap.get("sessions", 0)
+    if sessions < 5:
+        return ("unknown", 0.0, "too few sessions to infer")
+    monthly_api = snap.get("monthly_api_equivalent_cost_usd", 0.0)
+    models = snap.get("models") or []
+    opus_share = next((m.get("share", 0.0) for m in models if m.get("name", "").lower() == "opus"), 0.0)
+
+    # Rate-limit signal — needs digging into per-session data (not in snapshot
+    # summary). The structured engine doesn't surface this aggregate today, so
+    # we treat absence as "no signal" rather than "no rate limits."
+    rate_limits = snap.get("total_rate_limit_errors", 0)
+
+    # API key in env is a strong API-tier signal — if the user has one set
+    # AND tokenmin is running locally, they're probably API-authed for at
+    # least some of their work.
+    has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    # 1. API tier: explicit env signal + low monthly cost + diverse models
+    if has_api_key and monthly_api < 80 and len(models) >= 2:
+        return ("api", 0.75, "ANTHROPIC_API_KEY present, modest cost, diverse model mix")
+
+    # 2. Max tier: heavy Opus + high monthly cost + no rate-limit storm
+    if opus_share > 0.5 and monthly_api > 200 and rate_limits < 10:
+        return ("max", 0.75, f"heavy Opus ({int(opus_share*100)}%), ~${int(monthly_api)}/mo API-equivalent — only Max sustains this")
+    if opus_share > 0.3 and monthly_api > 100 and rate_limits < 5:
+        return ("max", 0.6, f"substantial Opus + ~${int(monthly_api)}/mo API-equivalent — most likely Max")
+
+    # 3. Pro tier: rate-limit hits + moderate cost (Pro caps out faster)
+    if rate_limits > 5 and monthly_api < 100:
+        return ("pro", 0.65, f"{rate_limits} rate-limit error(s) + modest cost — likely Pro hitting quota")
+
+    # 4. API tier (fallback): low cost + variety, no rate limits
+    if monthly_api < 30 and rate_limits == 0 and len(models) >= 2:
+        return ("api", 0.55, "low monthly cost, no rate limits, diverse models")
+
+    return ("unknown", 0.0, "signals ambiguous")
+
+
+def _maybe_billing_plan_consent(snapshot_dict: dict | None = None) -> None:
     """First interactive run asks how the user pays for Claude.
 
-    Without this, tokenmin reports 'Est. cost $X' which is the API-equivalent
-    cost — accurate at retail rates, but misleading on Pro/Max where the user
-    actually pays a flat fee. Knowing the plan lets us frame savings in the
-    right unit (dollars on API; % quota stretch on Pro/Max).
+    v0.12.9: when a snapshot is provided AND the plan is unknown, the prompt
+    leads with a heuristic suggestion derived from session data — the user
+    confirms with Enter or overrides with a single letter. Much faster than
+    the cold "pick one of four" prompt.
 
     Skips:
       - already set (any value in _VALID_PLANS other than 'unknown')
@@ -2530,24 +2599,45 @@ def _maybe_billing_plan_consent() -> None:
     if not (sys.stdin.isatty() and sys.stderr.isatty()):
         return
     c = _C(_ansi_supported())
-    print(f"\n  {c.BOLD}One quick question:{c.RESET} how do you pay for Claude?", file=sys.stderr)
-    print(f"  {c.DIM}Tokenmin reports cost at API rates. On Claude Pro/Max (flat fee) those{c.RESET}", file=sys.stderr)
-    print(f"  {c.DIM}numbers don't match your bill — knowing your plan lets us reframe them{c.RESET}", file=sys.stderr)
-    print(f"  {c.DIM}as 'quota stretch' instead of dollar savings.{c.RESET}", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"    {c.CYAN}a{c.RESET}) Anthropic API (metered, pay per token)", file=sys.stderr)
-    print(f"    {c.CYAN}p{c.RESET}) Claude Pro (~$20/mo flat)", file=sys.stderr)
-    print(f"    {c.CYAN}m{c.RESET}) Claude Max (~$100-$200/mo flat)", file=sys.stderr)
-    print(f"    {c.CYAN}s{c.RESET}) skip — leave as 'unknown' (you can set it later with `tokenmin plan <choice>`)", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"  Choose [a/p/m/s] ", end="", file=sys.stderr)
+
+    suggestion, confidence, reason = _suggest_billing_plan(snapshot_dict)
+    has_suggestion = suggestion in ("api", "pro", "max") and confidence >= 0.5
+
+    if has_suggestion:
+        print(f"\n  {c.BOLD}Quick check:{c.RESET} based on your usage, you're most likely on {c.BOLD}Claude {suggestion.capitalize()}{c.RESET}.", file=sys.stderr)
+        print(f"  {c.DIM}({reason}){c.RESET}", file=sys.stderr)
+        print(f"  {c.DIM}This sets how tokenmin frames cost: dollars for API, % quota for Pro/Max.{c.RESET}", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"  Confirm {suggestion.capitalize()}? [{c.CYAN}Y{c.RESET}/api/pro/max/skip] ", end="", file=sys.stderr)
+    else:
+        print(f"\n  {c.BOLD}One quick question:{c.RESET} how do you pay for Claude?", file=sys.stderr)
+        print(f"  {c.DIM}Tokenmin reports cost at API rates. On Pro/Max (flat fee) those numbers{c.RESET}", file=sys.stderr)
+        print(f"  {c.DIM}don't match your bill — knowing your plan reframes them as quota stretch.{c.RESET}", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"    {c.CYAN}a{c.RESET}) Anthropic API (metered, pay per token)", file=sys.stderr)
+        print(f"    {c.CYAN}p{c.RESET}) Claude Pro (~$20/mo flat)", file=sys.stderr)
+        print(f"    {c.CYAN}m{c.RESET}) Claude Max (~$100-$200/mo flat)", file=sys.stderr)
+        print(f"    {c.CYAN}s{c.RESET}) skip — leave as 'unknown'", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"  Choose [a/p/m/s] ", end="", file=sys.stderr)
+
     sys.stderr.flush()
     try:
         ans = input().strip().lower()
     except (EOFError, KeyboardInterrupt):
         ans = ""
-    plan_map = {"a": "api", "api": "api", "p": "pro", "pro": "pro", "m": "max", "max": "max"}
-    s["billing_plan"] = plan_map.get(ans, "unknown")
+
+    plan_map = {
+        "a": "api", "api": "api",
+        "p": "pro", "pro": "pro",
+        "m": "max", "max": "max",
+        "s": "unknown", "skip": "unknown", "n": "unknown",
+    }
+    if has_suggestion and ans in ("", "y", "yes"):
+        # Empty / Y / yes = confirm the suggestion
+        s["billing_plan"] = suggestion
+    else:
+        s["billing_plan"] = plan_map.get(ans, "unknown")
     s["billing_plan_asked"] = True
     _save_settings(s)
     if s["billing_plan"] == "unknown":

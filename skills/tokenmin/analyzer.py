@@ -83,6 +83,11 @@ class SessionStats:
     compacts: int = 0  # /compact invocations detected in user messages
     compact_then_died: int = 0  # /compact followed by session end within <=3 assistant turns
     opus_compactions: int = 0  # /compact turns where active model was Opus AND input was large (>50K)
+    # v0.12.9 — rate-limit errors are the strongest plan-detection signal we have.
+    # API users rarely hit them; Pro users hit them constantly; Max users hit
+    # them when bursting near quota. Counted separately from generic error_results
+    # so the billing-plan heuristic can use them as a signal.
+    rate_limit_errors: int = 0
     last_assistant_at: float | None = None  # internal — for gap math; not used outside analyzer
     turns_since_last_compact: int = -1  # internal — -1 = no compact yet this session
 
@@ -404,6 +409,19 @@ def parse_session(jsonl_path: Path, project_name: str, cutoff: float | None) -> 
                     b.get("text", "") for b in content if isinstance(b, dict)
                 )
             content_l = content.lower() if isinstance(content, str) else ""
+            # v0.12.9: rate-limit detection. Anthropic's rate-limit errors
+            # surface in tool_result content with phrases like
+            # "rate_limit_error", "rate limit exceeded", or "429". Counted
+            # separately from generic error_results so the billing-plan
+            # heuristic can use them as a signal (API users rarely hit them;
+            # Pro users hit them constantly; Max users only when bursting).
+            if (
+                "rate_limit" in content_l
+                or "rate limit" in content_l
+                or "429" in content_l
+                and ("limit" in content_l or "throttl" in content_l)
+            ):
+                stats.rate_limit_errors += 1
             if "permission" in content_l and "deni" in content_l:
                 stats.permission_denies += 1
                 # v0.12.6 — capture the normalized pattern of what got denied so

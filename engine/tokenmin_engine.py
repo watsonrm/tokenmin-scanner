@@ -59,6 +59,7 @@ def _session_from_dict(d: dict) -> SessionStats:
     s.compacts = d.get("compacts", 0)
     s.compact_then_died = d.get("compact_then_died", 0)
     s.opus_compactions = d.get("opus_compactions", 0)
+    s.rate_limit_errors = d.get("rate_limit_errors", 0)  # v0.12.9
     return s
 
 
@@ -253,6 +254,8 @@ def analyze_structured(snapshot: dict, billing_plan: str = "unknown") -> dict:
             "avg_tools_per_turn": avg_tools_per_turn,
             "total_cost_usd": snap.total_cost,
             "monthly_api_equivalent_cost_usd": monthly_api_cost,
+            # v0.12.9 — aggregate signal for the billing-plan heuristic.
+            "total_rate_limit_errors": sum(s.rate_limit_errors for s in snap.sessions),
             "window_days": snap.window_days,
             "models": models_list,
             "top_tools": top_tools_list,
