@@ -197,7 +197,12 @@ class UpdateCommandBehavior(unittest.TestCase):
                  unittest.mock.patch.object(tokenmin, "_version_info",
                                             return_value={"version": "0.1.0", "commit": "oldsha"}), \
                  unittest.mock.patch("subprocess.run", side_effect=fake_run), \
-                 unittest.mock.patch.dict("os.environ", {}, clear=False):
+                 unittest.mock.patch.dict("os.environ",
+                     # tests/run.sh exports TOKENMIN_AUTOUPDATE=off for test
+                     # isolation of the bash-wrapper auto-update path. The
+                     # _update_cmd path treats that as "refuse" — clear it
+                     # for these tests so the update code path runs.
+                     {"TOKENMIN_AUTOUPDATE": ""}, clear=False):
                 rc = tokenmin._update_cmd(["--check"])
             self.assertEqual(rc, 0)
 
@@ -230,7 +235,12 @@ class UpdateCommandBehavior(unittest.TestCase):
                  unittest.mock.patch.object(tokenmin, "_version_info",
                                             return_value={"version": "0.1.0", "commit": "oldsha000000"}), \
                  unittest.mock.patch("subprocess.run", side_effect=fake_run), \
-                 unittest.mock.patch.dict("os.environ", {}, clear=False):
+                 unittest.mock.patch.dict("os.environ",
+                     # tests/run.sh exports TOKENMIN_AUTOUPDATE=off for test
+                     # isolation of the bash-wrapper auto-update path. The
+                     # _update_cmd path treats that as "refuse" — clear it
+                     # for these tests so the update code path runs.
+                     {"TOKENMIN_AUTOUPDATE": ""}, clear=False):
                 rc = tokenmin._update_cmd([])
             self.assertEqual(rc, 0, "self-state files must not block update")
             self.assertTrue(ran["reset"], "update must actually reset to origin/main")
@@ -283,7 +293,12 @@ class UpdateCommandBehavior(unittest.TestCase):
                  unittest.mock.patch.object(tokenmin, "_version_info",
                                             return_value={"version": "0.1.0", "commit": "oldsha000000"}), \
                  unittest.mock.patch("subprocess.run", side_effect=fake_run), \
-                 unittest.mock.patch.dict("os.environ", {}, clear=False):
+                 unittest.mock.patch.dict("os.environ",
+                     # tests/run.sh exports TOKENMIN_AUTOUPDATE=off for test
+                     # isolation of the bash-wrapper auto-update path. The
+                     # _update_cmd path treats that as "refuse" — clear it
+                     # for these tests so the update code path runs.
+                     {"TOKENMIN_AUTOUPDATE": ""}, clear=False):
                 rc = tokenmin._update_cmd([])
             self.assertEqual(rc, 0)
             flat = [" ".join(c) for c in calls]
