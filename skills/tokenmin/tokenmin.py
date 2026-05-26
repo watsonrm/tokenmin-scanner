@@ -725,9 +725,20 @@ def main(argv: list[str] | None = None) -> int:
             return _render_help()
     if argv and argv[0] == "show":
         if len(argv) < 2:
-            print("usage: tokenmin show <finding-id>", file=sys.stderr)
+            print("usage: tokenmin show <finding-id> [--apply]", file=sys.stderr)
             return 2
-        return _render_show(argv[1])
+        # v0.12.11 (P2): parse `--apply` as a trailing flag on `show`. Kept
+        # off the main argparser since `show` is its own subcommand routed
+        # before argparse runs.
+        rest = argv[1:]
+        apply = False
+        if "--apply" in rest:
+            apply = True
+            rest = [a for a in rest if a != "--apply"]
+        if not rest:
+            print("usage: tokenmin show <finding-id> [--apply]", file=sys.stderr)
+            return 2
+        return _render_show(rest[0], apply=apply)
     if argv and argv[0] == "watch":
         return _watch(argv[1:])
     if argv and argv[0] == "demo":
@@ -1247,6 +1258,15 @@ def _render_terminal(result: dict) -> None:
     print(f"  {c.BOLD}{c.MAGENTA}Tokenmin{c.RESET}  Claude usage audit")
     print(f"  {c.GRAY}{line}{c.RESET}")
     print(f"  scanned {c.BOLD}{sessions}{c.RESET} sessions over {days} days")
+    # v0.12.11 (P1b): top projects in window — local render-time scan, not
+    # part of the snapshot sent to the engine.
+    try:
+        proj_scan = _top_projects(Path(snap.get("claude_home") or (Path.home() / ".claude")), int(days) or 30, n=3)
+    except Exception:
+        proj_scan = []
+    if proj_scan:
+        proj_summary = "  ·  ".join(f"{_project_display_name(name)} ({n})" for name, n in proj_scan)
+        print(f"  top projects: {c.DIM}{proj_summary}{c.RESET}")
     if subscription:
         # Don't show a dollar number — Pro/Max users pay flat. Show plan instead.
         print(f"  plan: {c.BOLD}{plan}{c.RESET} {c.DIM}(flat-fee; savings reported as quota stretch){c.RESET}")
@@ -1282,24 +1302,69 @@ def _render_terminal(result: dict) -> None:
         primary = [findings[0]]
         low_impact = findings[1:]
 
+    # v0.12.11 (P3): applied-fix memory banner. Shown above the headline so
+    # repeat users see "yes, your work counted" before the new asks.
+    applied_lines = _format_applied_banner(c)
+    if applied_lines:
+        for ln in applied_lines:
+            print(ln)
+        print()
+
+    # v0.12.11 (P4): lever / pillar scorecard derived from this run's
+    # findings. Directional — flags which pillar has the most headroom.
+    score = _lever_scorecard(findings)
+    if score:
+        ranked = sorted(score.items(), key=lambda kv: kv[1]["score"])
+        chunks = []
+        for pid, b in ranked:
+            label = _PILLAR_LABELS.get(pid, pid)
+            chunks.append(f"{label} {b['score']:.0f}/10")
+        worst = ranked[0]
+        worst_label = _PILLAR_LABELS.get(worst[0], worst[0])
+        print(f"  {c.BOLD}Levers{c.RESET}  {c.DIM}{'  ·  '.join(chunks)}{c.RESET}")
+        if worst[1]["score"] < 9.0:
+            print(f"          {c.DIM}most headroom: {worst_label}{c.RESET}")
+        print()
+
     # Headline — plan-aware. Counts include both buckets so the user knows
     # the engine isn't broken when 7 findings collapse to 3 in the display.
+    # v0.12.11 (P1a): headline total is confidence-discounted per-finding,
+    # then summed. The raw engine total stays in last_run.json; we just
+    # don't put an inflated number on the most-visible line.
+    discounted_total = sum(
+        _discounted_savings(
+            float(f.get("savings_usd_per_month", 0)),
+            float(f.get("confidence", 0)),
+        )[0]
+        for f in findings
+    )
     if subscription:
-        total_unit = _fmt_quota_pct(total_save, monthly_api)
+        total_unit = _fmt_quota_pct(discounted_total, monthly_api)
         print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  {c.BOLD}{total_unit}{c.RESET} stretch across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
     else:
-        print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(total_save)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
+        print(f"  {c.BOLD}{c.YELLOW}Headline{c.RESET}  ~{c.BOLD}{_fmt_money(discounted_total)}/mo{c.RESET} recoverable across {len(findings)} fix(es), ~{total_eff:.1f} hrs total")
     print()
 
-    max_save = max((f["savings_usd_per_month"] for f in primary), default=1.0) or 1.0
+    # v0.12.11 (P1a): rank and display using confidence-discounted savings.
+    # The raw `savings_usd_per_month` stays on the finding for the engine's
+    # own bookkeeping; we just don't show users the un-discounted dollars.
+    def _display_save(f: dict) -> float:
+        ds, _ = _discounted_savings(
+            float(f.get("savings_usd_per_month", 0)),
+            float(f.get("confidence", 0)),
+        )
+        return ds
+    max_save = max((_display_save(f) for f in primary), default=1.0) or 1.0
 
     for i, f in enumerate(primary, 1):
-        save = f["savings_usd_per_month"]
-        pill, color_attr, _ = _severity(save)
+        raw_save = float(f.get("savings_usd_per_month", 0))
+        conf_frac = float(f.get("confidence", 0))
+        disc_save, hide_dollar = _discounted_savings(raw_save, conf_frac)
+        pill, color_attr, _ = _severity(disc_save)
         pill_color = getattr(c, color_attr)
-        rel = save / max_save if max_save > 0 else 0
+        rel = disc_save / max_save if max_save > 0 else 0
         pillar = _PILLAR_LABELS.get(f.get("pillar", ""), "")
-        conf = int(f.get("confidence", 0) * 100)
+        conf = int(conf_frac * 100)
         hrs = f.get("hours_to_implement", 0.0)
 
         # Strip control chars — ANSI injection defense via finding titles.
@@ -1307,15 +1372,23 @@ def _render_terminal(result: dict) -> None:
         evidence = _strip_ctl(f.get("evidence", ""))
         finding_id = _strip_ctl(f["id"])
 
-        if subscription:
-            save_unit = _fmt_quota_pct(save, monthly_api)
+        if hide_dollar:
+            # Low-confidence finding: don't put a dollar number on the headline.
+            save_unit = f"{c.DIM}(low conf — see drill-down){c.RESET}"
+        elif subscription:
+            save_unit = _fmt_quota_pct(disc_save, monthly_api)
         else:
-            save_unit = f"{_fmt_money(save)}/mo"
+            save_unit = f"{_fmt_money(disc_save)}/mo"
+
+        apply_hint = (
+            f"  {c.CYAN}· --apply available{c.RESET}"
+            if finding_id in _APPLY_SUPPORTED_IDS else ""
+        )
 
         print(f"  {c.BOLD}{i}.{c.RESET} {c.BOLD}{title}{c.RESET}")
         print(f"     {pill_color}{pill}{c.RESET}  {_bar(rel)}  {c.BOLD}{save_unit}{c.RESET}  {c.DIM}{hrs:.1f} hrs · conf {conf}% · {pillar}{c.RESET}")
         print(f"     {c.DIM}evidence:{c.RESET} {evidence}")
-        print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {finding_id}{c.RESET}")
+        print(f"     {c.CYAN}→{c.RESET} {c.DIM}tokenmin show {finding_id}{c.RESET}{apply_hint}")
         print()
 
     if low_impact:
@@ -1331,13 +1404,14 @@ def _print_next_steps(c: "_C", findings: list) -> None:
     print(f"  next steps:")
     if findings:
         print(f"    {c.BOLD}tokenmin show <id>{c.RESET}    drill into one finding")
+    print(f"    {c.BOLD}tokenmin watch{c.RESET}            live spend dashboard while Claude is running")
     print(f"    {c.BOLD}tokenmin --out report.md{c.RESET}  write the full markdown report")
     print(f"    {c.BOLD}tokenmin help{c.RESET}             30-second walkthrough")
     print(f"    {c.GRAY}guide: https://tokenmin.ai/guides/claude-token-optimization{c.RESET}")
     print()
 
 
-def _render_show(finding_id: str) -> int:
+def _render_show(finding_id: str, apply: bool = False) -> int:
     """Drill-down into one finding. Reads last_run.json.
 
     Special id `low-impact` lists all findings the engine flagged as below
@@ -1346,6 +1420,9 @@ def _render_show(finding_id: str) -> int:
 
     Plan-aware: subscription users see `~Y% quota` instead of `$X/mo`
     (scanner#5 — show was leaking dollars even after v0.12.3).
+
+    v0.12.11: `apply=True` dispatches the finding to its --apply handler
+    (after the drill-down renders).
     """
     c = _C(_ansi_supported())
     last = _load_last_run()
@@ -1388,11 +1465,13 @@ def _render_show(finding_id: str) -> int:
             print(f"    low-impact  (list all hidden findings)", file=sys.stderr)
         return 2
 
-    save = found["savings_usd_per_month"]
-    pill, color_attr, label = _severity(save)
+    raw_save = float(found.get("savings_usd_per_month", 0))
+    conf_frac = float(found.get("confidence", 0))
+    disc_save, hide_dollar = _discounted_savings(raw_save, conf_frac)
+    pill, color_attr, label = _severity(disc_save)
     pill_color = getattr(c, color_attr)
     pillar = _PILLAR_LABELS.get(found.get("pillar", ""), "hygiene")
-    conf = int(found.get("confidence", 0) * 100)
+    conf = int(conf_frac * 100)
     hrs = found.get("hours_to_implement", 0.0)
 
     title = _strip_ctl(found["title"])
@@ -1400,11 +1479,15 @@ def _render_show(finding_id: str) -> int:
     evidence = _strip_ctl(found.get("evidence", ""))
     how_to_fix = _strip_ctl(found.get("how_to_fix", "") or "")
 
-    # Plan-aware impact line — no dollar leak for Pro/Max.
-    if subscription:
-        impact_line = f"{c.BOLD}{_fmt_quota_pct(save, monthly_api)}{c.RESET} stretch on your flat-fee plan"
+    # v0.12.11 (P1a): plan-aware impact line, confidence-discounted. The raw
+    # un-discounted number is shown one line below as "engine estimate" so
+    # power-users can see both numbers and judge the spread.
+    if hide_dollar:
+        impact_line = f"{c.DIM}low confidence ({conf}%) — number suppressed; engine estimate ~{_fmt_money(raw_save)}/mo{c.RESET}"
+    elif subscription:
+        impact_line = f"{c.BOLD}{_fmt_quota_pct(disc_save, monthly_api)}{c.RESET} stretch on your flat-fee plan"
     else:
-        impact_line = f"{c.BOLD}{_fmt_money(save)}/mo{c.RESET} estimated savings (at API rates)"
+        impact_line = f"{c.BOLD}{_fmt_money(disc_save)}/mo{c.RESET} estimated savings  {c.DIM}(engine estimate ~{_fmt_money(raw_save)}/mo × {conf}% conf){c.RESET}"
 
     print()
     print(f"  {c.BOLD}{c.MAGENTA}{title}{c.RESET}")
@@ -1428,6 +1511,18 @@ def _render_show(finding_id: str) -> int:
     for line in how_to_fix.splitlines():
         print(f"  {line}")
     print()
+
+    # v0.12.11 (P2): --apply hint and dispatch.
+    if fid in _APPLY_SUPPORTED_IDS:
+        if apply:
+            print(f"  {c.BOLD}{c.CYAN}Applying...{c.RESET}")
+            return _apply_finding(found)
+        print(f"  {c.BOLD}{c.CYAN}Auto-apply available{c.RESET}")
+        print(f"    {c.CYAN}tokenmin show {fid} --apply{c.RESET}")
+        print()
+    elif apply:
+        # User asked for --apply on a finding we don't support
+        return _apply_finding(found)
     return 0
 
 
@@ -1520,6 +1615,304 @@ def _load_last_run() -> dict | None:
         return json.loads(_last_run_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+# --- v0.12.11: confidence-discount, scope hints, applied memory, --apply ---
+
+def _discounted_savings(savings: float, confidence: float) -> tuple[float, bool]:
+    """Confidence-discount a finding's savings before display.
+
+    Returns (display_dollars, hide_dollar). Below 0.4 confidence we hide
+    the dollar number entirely. Rationale: pre-v0.12.11 the headline finding
+    routinely showed $9000+ at 0.2 confidence, and the engine itself often
+    appended hedges to that exact finding — the inconsistent framing burned
+    user trust on the first screen.
+    """
+    if confidence < 0.4:
+        return (0.0, True)
+    return (savings * confidence, False)
+
+
+def _top_projects(claude_home: Path, days: int, n: int = 3) -> list[tuple[str, int]]:
+    """Return [(project_name, recent_session_count), ...] desc.
+
+    Recent = .jsonl mtime within `days`. Doesn't parse JSONL — just file
+    stats. Sub-100ms on a typical ~/.claude/projects/ tree.
+    """
+    from collections import Counter
+    cutoff = time.time() - max(1, days) * 86400
+    counts: Counter[str] = Counter()
+    proj_root = claude_home / "projects"
+    if not proj_root.exists():
+        return []
+    for proj_dir in proj_root.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        for jsonl in proj_dir.glob("*.jsonl"):
+            try:
+                if jsonl.stat().st_mtime >= cutoff:
+                    counts[proj_dir.name] += 1
+            except OSError:
+                continue
+    return counts.most_common(n)
+
+
+def _project_display_name(raw: str) -> str:
+    """Claude Code project dirs are encoded paths like
+    `-Users-rick-Documents-Foo`. Strip the path prefix down to the
+    user-recognizable leaf for display."""
+    parts = [p for p in raw.split("-") if p]
+    while parts and parts[0] in ("Users",):
+        parts.pop(0)
+        if parts:  # skip the username
+            parts.pop(0)
+    while parts and parts[0] in ("Documents", "src", "code", "Code"):
+        parts.pop(0)
+    return "/".join(parts) if parts else raw
+
+
+# --- applied-fix memory (P3) -----------------------------------------------
+
+def _applied_fixes_path() -> Path:
+    return Path.home() / ".tokenmin" / "applied_fixes.json"
+
+
+def _load_applied_fixes() -> list[dict]:
+    try:
+        return json.loads(_applied_fixes_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _record_applied_fix(finding_id: str, target_path: str, finding_title: str = "") -> None:
+    path = _applied_fixes_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log = _load_applied_fixes()
+    log.append({
+        "finding_id": finding_id,
+        "title": finding_title,
+        "target": target_path,
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    data = json.dumps(log, indent=2, default=str).encode("utf-8")
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(path))
+
+
+def _format_applied_banner(c: "_C") -> list[str]:
+    """Render the 'you applied X N days ago' banner for the top of the report.
+    Returns the line list (empty list = nothing to show)."""
+    log = _load_applied_fixes()
+    if not log:
+        return []
+    recent = sorted(log, key=lambda x: x.get("at", ""), reverse=True)[:3]
+    now = datetime.now(timezone.utc)
+    lines: list[str] = [f"  {c.BOLD}Applied{c.RESET}  {c.DIM}your last {len(recent)} fix(es){c.RESET}"]
+    for entry in recent:
+        try:
+            at = datetime.fromisoformat(entry["at"].replace("Z", "+00:00"))
+            days = max(0, (now - at).days)
+            ago = "today" if days == 0 else f"{days}d ago"
+        except (KeyError, ValueError):
+            ago = "earlier"
+        fid = entry.get("finding_id", "?")
+        title = (entry.get("title") or fid)[:60]
+        lines.append(f"    {c.GREEN}✓{c.RESET} {ago:>8}  {c.DIM}{title}{c.RESET}")
+    return lines
+
+
+# --- --apply (P2) ----------------------------------------------------------
+#
+# Auto-apply ships for a small whitelist of findings whose fix is a CLEAN
+# structured artifact (file create or markdown prepend). Findings whose fix
+# is a JSON-schema-sensitive hook (bash_cat_instead_of_read) intentionally
+# fall through to manual instructions — shipping a buggy hook is worse than
+# shipping no auto-apply.
+
+_APPLY_SUPPORTED_IDS = frozenset({
+    "no_global_claude_md",
+    "parallel_tools_underused",
+})
+
+
+def _apply_finding(finding: dict) -> int:
+    """Apply a finding's fix. Returns 0 on success, 1 on user-decline,
+    2 on not-supported."""
+    fid = finding.get("id", "")
+    handlers = {
+        "no_global_claude_md":      _apply_global_claude_md,
+        "parallel_tools_underused": _apply_parallel_tools_hint,
+    }
+    h = handlers.get(fid)
+    if not h:
+        print(
+            f"tokenmin: --apply not supported for finding '{fid}'.\n"
+            f"  Auto-apply currently covers: {', '.join(sorted(handlers))}.\n"
+            f"  Read the 'How to fix' section above and apply by hand.",
+            file=sys.stderr,
+        )
+        return 2
+    return h(finding)
+
+
+def _confirm(prompt: str) -> bool:
+    """Yes/No prompt; defaults to NO; returns False if non-interactive.
+
+    Escape hatch: `TOKENMIN_ASSUME_YES=1` forces a yes. Intended for tests
+    and for agent-mode invocations where the orchestrator has already
+    obtained user consent through its own channel (e.g. a chat
+    'apply this?' confirmation). Documented in SECURITY.md.
+    """
+    if os.environ.get("TOKENMIN_ASSUME_YES") == "1":
+        print(f"  (TOKENMIN_ASSUME_YES=1; auto-confirming)", file=sys.stderr)
+        return True
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        print(f"  (non-interactive shell; declining — set TOKENMIN_ASSUME_YES=1 to override)", file=sys.stderr)
+        return False
+    try:
+        ans = input(f"  {prompt} [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("y", "yes")
+
+
+def _backup_file(path: Path) -> Path | None:
+    """Copy `path` to `path.tokenmin.bak.<ts>` so the user can revert.
+    Returns the backup path, or None if the source didn't exist."""
+    if not path.exists():
+        return None
+    import shutil
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    bak = path.with_suffix(path.suffix + f".tokenmin.bak.{ts}")
+    shutil.copy2(path, bak)
+    return bak
+
+
+def _print_diff(before: str, after: str, label: str) -> None:
+    import difflib
+    diff = list(difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{label}",
+        tofile=f"b/{label}",
+    ))
+    c = _C(_ansi_supported())
+    for line in diff:
+        s = line.rstrip("\n")
+        if line.startswith("+++") or line.startswith("---"):
+            print(f"  {c.BOLD}{s}{c.RESET}")
+        elif line.startswith("@@"):
+            print(f"  {c.CYAN}{s}{c.RESET}")
+        elif line.startswith("+"):
+            print(f"  {c.GREEN}{s}{c.RESET}")
+        elif line.startswith("-"):
+            print(f"  {c.RED}{s}{c.RESET}")
+        else:
+            print(f"  {s}")
+
+
+def _apply_global_claude_md(finding: dict) -> int:
+    """Create ~/.claude/CLAUDE.md with a starter template if missing."""
+    target = Path.home() / ".claude" / "CLAUDE.md"
+    if target.exists():
+        print(f"  already present: {target} exists; not overwriting.", file=sys.stderr)
+        return 0
+    template = (
+        "# Global instructions for Claude Code\n"
+        "\n"
+        "Conventions Claude should apply across every project on this machine.\n"
+        "Keep under 200 lines — past that, adherence drops (Anthropic guidance).\n"
+        "\n"
+        "## Tools\n"
+        "- Prefer Read / Grep / Glob over `cat`, `grep`, `find` via Bash.\n"
+        "- When reading multiple files, batch the Read calls in a single response.\n"
+        "\n"
+        "## Output\n"
+        "- Be terse on routine plumbing tasks; deliver findings, not narration.\n"
+        "- Use markdown link syntax `[label](path)` for file references.\n"
+        "\n"
+        "## Session hygiene\n"
+        "- `/clear` between unrelated tasks rather than letting context bloat.\n"
+        "- `/compact` near 50% context to keep performance high.\n"
+    )
+    print()
+    print(f"  Will create: {target}")
+    _print_diff("", template, "CLAUDE.md")
+    print()
+    if not _confirm("Create this file?"):
+        print("  declined; no changes written.", file=sys.stderr)
+        return 1
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(template, encoding="utf-8")
+    print(f"  created: {target}", file=sys.stderr)
+    _record_applied_fix(finding.get("id", ""), str(target), finding.get("title", ""))
+    return 0
+
+
+def _apply_parallel_tools_hint(finding: dict) -> int:
+    """Prepend a parallel-tool-batching nudge to ~/.claude/CLAUDE.md, creating
+    the file if needed. Idempotent via a marker comment."""
+    target = Path.home() / ".claude" / "CLAUDE.md"
+    marker = "tokenmin: batch parallel tool calls"
+    nudge = (
+        "## Parallel tool calls\n"
+        f"<!-- {marker} -->\n"
+        "When you need to read or search multiple files, batch the Read/Grep/Glob\n"
+        "calls in a single response rather than reading them sequentially. The\n"
+        "tools-per-turn ratio is a leading indicator of how much speed you're\n"
+        "leaving on the table.\n\n"
+    )
+    before_text = target.read_text(encoding="utf-8") if target.exists() else ""
+    if marker in before_text:
+        print(f"  already applied — parallel-tools nudge present in {target}.", file=sys.stderr)
+        return 0
+    after_text = nudge + before_text
+    print()
+    print(f"  Will {'modify' if target.exists() else 'create'}: {target}")
+    _print_diff(before_text, after_text, "CLAUDE.md")
+    print()
+    if not _confirm("Apply this change?"):
+        print("  declined; no changes written.", file=sys.stderr)
+        return 1
+    bak = _backup_file(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(after_text, encoding="utf-8")
+    if bak:
+        print(f"  backup: {bak}", file=sys.stderr)
+    print(f"  applied: {target}", file=sys.stderr)
+    _record_applied_fix(finding.get("id", ""), str(target), finding.get("title", ""))
+    return 0
+
+
+# --- lever scorecard (P4) --------------------------------------------------
+
+def _lever_scorecard(findings: list[dict]) -> dict[str, dict]:
+    """Score each lever/pillar based on its findings' (savings × confidence).
+
+    Pillar starts at 10/10; each finding subtracts a confidence-weighted
+    penalty proportional to its savings (cap 4pt per finding). Directional
+    only — the absolute score is less interesting than the relative ranking
+    of which lever has the most headroom.
+    """
+    out: dict[str, dict] = {}
+    for f in findings:
+        pillar = str(f.get("pillar", "hygiene"))
+        if pillar not in _PILLAR_LABELS:
+            pillar = "hygiene"
+        bucket = out.setdefault(pillar, {"score": 10.0, "count": 0, "top_savings": 0.0})
+        save = float(f.get("savings_usd_per_month", 0))
+        conf = float(f.get("confidence", 0))
+        penalty = min(4.0, (save * conf) / 25.0)
+        bucket["score"] = max(0.0, bucket["score"] - penalty)
+        bucket["count"] += 1
+        bucket["top_savings"] = max(bucket["top_savings"], save * conf)
+    return out
 
 
 # --- progress indicator ----------------------------------------------------
