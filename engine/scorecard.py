@@ -3,36 +3,51 @@
 SPDX-License-Identifier: Apache-2.0
 
 One fixed 1200×630 card (the standard social/OG image size) rendered from a
-Tokenmin Score dict (see scoring.py). The SVG is the canonical artifact — it
-opens in any browser and embeds straight into the HTML page. PNG export is
-best-effort via Pillow (clean pip install, no system libs) with a cairosvg
-fallback; if neither is present the caller still has the SVG + HTML to screenshot.
+Tokenmin Score dict (see scoring.py). Styled to the RMW Commerce Consulting
+brand (Brand Guidelines v1.0): indigo #263F73, supporting blues, Raleway
+(display) + Open Sans (body), and the RMW logomark. Brand assets are bundled
+under engine/assets/ so every card is self-contained and on-brand.
 
-The card carries ONLY aggregate numbers (grade, composite, four pillar scores) —
-no paths, names, or message content — so it is safe to share by construction.
+The SVG is the canonical artifact — it opens in any browser and embeds straight
+into the HTML page. PNG export is best-effort via Pillow (clean pip install, no
+system libs), which also gives us pixel-accurate brand typography. The card
+carries ONLY aggregate numbers (grade, composite, four pillar scores) — no
+paths, names, or content — so it is safe to share by construction.
 """
 from __future__ import annotations
 
+import base64
 from html import escape
+from pathlib import Path
 
 WIDTH, HEIGHT = 1200, 630
+_ASSETS = Path(__file__).resolve().parent / "assets"
 
-# Palette (placeholder RMW-leaning; Rick can swap the hexes + drop in a logo).
-BG = "#0B1020"
-BG2 = "#11182E"
-CARD = "#0F1730"
-TEXT = "#F8FAFC"
-MUTED = "#94A3B8"
-TRACK = "#1E293B"
-ACCENT = "#38BDF8"
+# --- RMW Commerce brand palette (Brand Guidelines v1.0) ---------------------
+PAGE_TOP = "#EDF0F5"
+PAGE_BOT = "#E1E6EF"
+CARD = "#FFFFFF"
+INDIGO = "#263F73"      # primary brand
+INK = "#1A2540"         # primary text
+INK2 = "#4B5673"        # secondary text
+MUTED = "#9B9190"       # metadata / footer
+RULE = "#D7DDE8"        # hairline dividers
+TRACK = "#E6EAF1"       # bar / ring track
+ACCENT = "#4978A8"      # blue-yonder accent
 
+# Grade colors: brand-aligned but kept on a green→red semantic scale so the
+# grade reads instantly (A teal · B blue · C amber · D brown · F danger-red).
 _GRADE_COLORS = {
-    "A": "#22C55E", "B": "#14B8A6", "C": "#EAB308", "D": "#F97316", "F": "#EF4444",
+    "A": "#2A869C",   # brand teal-blue (positive)
+    "B": "#4978A8",   # brand blue-yonder
+    "C": "#C8922E",   # amber (derived)
+    "D": "#8C5B33",   # brand brown (warning)
+    "F": "#B94A48",   # brand danger
 }
 
 
 def grade_color(grade: str) -> str:
-    return _GRADE_COLORS.get((grade or "F")[0].upper(), "#EF4444")
+    return _GRADE_COLORS.get((grade or "F")[0].upper(), "#B94A48")
 
 
 def caption_for(score: dict) -> str:
@@ -49,7 +64,8 @@ def caption_for(score: dict) -> str:
 def _bars(score: dict) -> list[tuple[str, int]]:
     pls = score.get("pillars", {}) or {}
     labels = score.get("pillar_labels", {}) or {}
-    return [(labels.get(p, f"Pillar {p}"), int(pls.get(p, 0))) for p in ("1", "2", "3", "4") if p in pls]
+    return [(labels.get(p, f"Pillar {p}"), int(pls.get(p, 0)))
+            for p in ("1", "2", "3", "4") if p in pls]
 
 
 def _next_line(top_finding: dict | None) -> str:
@@ -61,6 +77,14 @@ def _next_line(top_finding: dict | None) -> str:
 
 # --- SVG (canonical) --------------------------------------------------------
 
+def _logo_data_uri() -> str | None:
+    try:
+        raw = (_ASSETS / "rmw_logomark.png").read_bytes()
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except OSError:
+        return None
+
+
 def render_svg(score: dict, top_finding: dict | None = None, meta: dict | None = None) -> str:
     meta = meta or {}
     grade = score.get("grade", "?")
@@ -69,93 +93,75 @@ def render_svg(score: dict, top_finding: dict | None = None, meta: dict | None =
     gcolor = grade_color(grade)
     provisional = score.get("provisional")
     percentile = score.get("percentile")
-    font = ("-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, "
-            "Helvetica, Arial, sans-serif")
+    disp = "'Raleway','Helvetica Neue',Arial,sans-serif"
+    body = "'Open Sans','Helvetica Neue',Arial,sans-serif"
 
-    # Left hero ring.
-    cx, cy, r = 230, 300, 150
-    parts: list[str] = []
-    parts.append(
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" '
-        f'viewBox="0 0 {WIDTH} {HEIGHT}" font-family="{font}">'
-    )
-    parts.append(
-        f'<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">'
-        f'<stop offset="0" stop-color="{BG}"/><stop offset="1" stop-color="{BG2}"/>'
-        f'</linearGradient></defs>'
-    )
-    parts.append(f'<rect width="{WIDTH}" height="{HEIGHT}" fill="url(#bg)"/>')
-    parts.append(f'<rect x="32" y="32" width="{WIDTH-64}" height="{HEIGHT-64}" rx="28" fill="{CARD}"/>')
+    cx, cy, r = 232, 322, 150
+    p: list[str] = []
+    p.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" '
+             f'viewBox="0 0 {WIDTH} {HEIGHT}">')
+    p.append('<defs><linearGradient id="pg" x1="0" y1="0" x2="0" y2="1">'
+             f'<stop offset="0" stop-color="{PAGE_TOP}"/>'
+             f'<stop offset="1" stop-color="{PAGE_BOT}"/></linearGradient></defs>')
+    p.append(f'<rect width="{WIDTH}" height="{HEIGHT}" fill="url(#pg)"/>')
+    p.append(f'<rect x="32" y="32" width="{WIDTH-64}" height="{HEIGHT-64}" rx="28" '
+             f'fill="{CARD}" stroke="{RULE}" stroke-width="2"/>')
 
-    # Eyebrow.
-    parts.append(
-        f'<text x="80" y="104" fill="{MUTED}" font-size="26" font-weight="700" '
-        f'letter-spacing="3">TOKENMIN SCORE</text>'
-    )
+    # Eyebrow + logomark.
+    p.append(f'<text x="80" y="100" fill="{INDIGO}" font-family="{disp}" font-size="26" '
+             f'font-weight="700" letter-spacing="4">TOKENMIN SCORE</text>')
+    logo = _logo_data_uri()
+    if logo:
+        p.append(f'<image href="{logo}" x="1000" y="56" width="88" height="88"/>')
 
-    # Hero grade ring.
-    parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{TRACK}" stroke-width="20"/>')
-    frac = max(0.0, min(1.0, comp / 100.0))
+    # Hero ring + grade.
     import math
+    p.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{TRACK}" stroke-width="22"/>')
     circ = 2 * math.pi * r
-    dash = circ * frac
-    parts.append(
-        f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{gcolor}" stroke-width="20" '
-        f'stroke-linecap="round" stroke-dasharray="{dash:.1f} {circ:.1f}" '
-        f'transform="rotate(-90 {cx} {cy})"/>'
-    )
-    parts.append(
-        f'<text x="{cx}" y="{cy+30}" fill="{gcolor}" font-size="150" font-weight="800" '
-        f'text-anchor="middle">{escape(grade)}</text>'
-    )
-    parts.append(
-        f'<text x="{cx}" y="{cy+92}" fill="{MUTED}" font-size="30" font-weight="600" '
-        f'text-anchor="middle">{comp}/100</text>'
-    )
+    dash = circ * max(0.0, min(1.0, comp / 100.0))
+    p.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{gcolor}" stroke-width="22" '
+             f'stroke-linecap="round" stroke-dasharray="{dash:.1f} {circ:.1f}" '
+             f'transform="rotate(-90 {cx} {cy})"/>')
+    p.append(f'<text x="{cx}" y="{cy+34}" fill="{gcolor}" font-family="{disp}" font-size="150" '
+             f'font-weight="800" text-anchor="middle">{escape(grade)}</text>')
+    p.append(f'<text x="{cx}" y="{cy+96}" fill="{INK2}" font-family="{body}" font-size="30" '
+             f'font-weight="700" text-anchor="middle">{comp}/100</text>')
 
     # Right column: tier + subtitle + pillar bars.
-    rx = 470
-    parts.append(
-        f'<text x="{rx}" y="172" fill="{TEXT}" font-size="62" font-weight="800">{escape(tier)}</text>'
-    )
-    # Subtitle: provisional note takes priority, else the single next-step hook.
+    rx = 472
+    p.append(f'<text x="{rx}" y="176" fill="{INDIGO}" font-family="{disp}" font-size="60" '
+             f'font-weight="800">{escape(tier)}</text>')
     nxt = _next_line(top_finding)
     if provisional:
-        parts.append(
-            f'<text x="{rx}" y="212" fill="{MUTED}" font-size="23" font-style="italic">'
-            f'provisional — re-run after a week of use</text>'
-        )
+        p.append(f'<text x="{rx}" y="216" fill="{MUTED}" font-family="{body}" font-size="23" '
+                 f'font-style="italic">provisional — re-run after a week of use</text>')
     elif nxt:
         sub = nxt if len(nxt) <= 52 else nxt[:51] + "…"
-        parts.append(
-            f'<text x="{rx}" y="212" fill="{ACCENT}" font-size="23" font-weight="600">{escape(sub)}</text>'
-        )
+        p.append(f'<text x="{rx}" y="216" fill="{ACCENT}" font-family="{body}" font-size="23" '
+                 f'font-weight="600">{escape(sub)}</text>')
 
-    bars = _bars(score)
-    by = 268
-    bar_w, bar_h = 560, 16
-    for label, val in bars:
-        parts.append(f'<text x="{rx}" y="{by-8}" fill="{MUTED}" font-size="22" font-weight="600">{escape(label)}</text>')
-        parts.append(f'<text x="{rx+bar_w}" y="{by-8}" fill="{TEXT}" font-size="22" font-weight="700" text-anchor="end">{val}</text>')
-        parts.append(f'<rect x="{rx}" y="{by}" width="{bar_w}" height="{bar_h}" rx="8" fill="{TRACK}"/>')
-        fill_w = max(8, int(bar_w * max(0, min(100, val)) / 100))
-        parts.append(f'<rect x="{rx}" y="{by}" width="{fill_w}" height="{bar_h}" rx="8" fill="{grade_color(grade)}"/>')
-        by += 64
+    by, bar_w, bar_h = 282, 556, 16
+    for label, val in _bars(score):
+        p.append(f'<text x="{rx}" y="{by-8}" fill="{INK2}" font-family="{body}" font-size="22" '
+                 f'font-weight="600">{escape(label)}</text>')
+        p.append(f'<text x="{rx+bar_w}" y="{by-8}" fill="{INK}" font-family="{body}" font-size="22" '
+                 f'font-weight="700" text-anchor="end">{val}</text>')
+        p.append(f'<rect x="{rx}" y="{by}" width="{bar_w}" height="{bar_h}" rx="8" fill="{TRACK}"/>')
+        fw = max(8, int(bar_w * max(0, min(100, val)) / 100))
+        p.append(f'<rect x="{rx}" y="{by}" width="{fw}" height="{bar_h}" rx="8" fill="{gcolor}"/>')
+        by += 62
 
     # Footer.
     fy = HEIGHT - 64
-    parts.append(f'<line x1="80" y1="{fy-26}" x2="{WIDTH-80}" y2="{fy-26}" stroke="{TRACK}" stroke-width="2"/>')
-    parts.append(
-        f'<text x="80" y="{fy+6}" fill="{MUTED}" font-size="24" font-weight="600">'
-        f'tokenmin.ai · built by RMW Commerce</text>'
-    )
+    p.append(f'<line x1="80" y1="{fy-26}" x2="{WIDTH-80}" y2="{fy-26}" stroke="{RULE}" stroke-width="2"/>')
+    p.append(f'<text x="80" y="{fy+6}" fill="{INK2}" font-family="{body}" font-size="24" '
+             f'font-weight="600">tokenmin.ai · built by RMW Commerce</text>')
     if percentile is not None:
-        parts.append(
-            f'<text x="{WIDTH-80}" y="{fy+6}" fill="{TEXT}" font-size="24" font-weight="700" '
-            f'text-anchor="end">Top {100-int(percentile)}% of developers</text>'
-        )
-    parts.append('</svg>')
-    return "".join(parts)
+        p.append(f'<text x="{WIDTH-80}" y="{fy+6}" fill="{INDIGO}" font-family="{body}" '
+                 f'font-size="24" font-weight="700" text-anchor="end">'
+                 f'Top {100-int(percentile)}% of developers</text>')
+    p.append('</svg>')
+    return "".join(p)
 
 
 # --- HTML wrapper -----------------------------------------------------------
@@ -167,19 +173,19 @@ def wrap_html(svg: str, caption: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My Tokenmin Score</title>
 <style>
-  body {{ margin:0; background:{BG}; color:{TEXT};
-         font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  body {{ margin:0; background:{PAGE_BOT}; color:{INK};
+         font-family:'Open Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
          display:flex; flex-direction:column; align-items:center; padding:40px 16px; }}
   .card {{ width:100%; max-width:900px; }}
   .card svg {{ width:100%; height:auto; border-radius:18px;
-               box-shadow:0 20px 60px rgba(0,0,0,.45); display:block; }}
+               box-shadow:0 18px 50px rgba(38,63,115,.22); display:block; }}
   .share {{ max-width:900px; width:100%; margin-top:24px;
-            background:{CARD}; border:1px solid {TRACK}; border-radius:14px; padding:18px 20px; }}
-  .share p {{ margin:0 0 12px; color:{MUTED}; font-size:15px; }}
-  .row {{ display:flex; gap:10px; align-items:center; }}
-  textarea {{ flex:1; background:{BG2}; color:{TEXT}; border:1px solid {TRACK};
+            background:{CARD}; border:1px solid {RULE}; border-radius:14px; padding:18px 20px; }}
+  .share p {{ margin:0 0 12px; color:{INK2}; font-size:15px; }}
+  .row {{ display:flex; gap:10px; align-items:flex-start; }}
+  textarea {{ flex:1; background:#F7F9FC; color:{INK}; border:1px solid {RULE};
               border-radius:10px; padding:12px; font-size:15px; resize:vertical; min-height:60px; }}
-  button {{ background:{ACCENT}; color:#04121f; border:0; border-radius:10px;
+  button {{ background:{INDIGO}; color:#fff; border:0; border-radius:10px;
             padding:12px 16px; font-weight:700; font-size:15px; cursor:pointer; white-space:nowrap; }}
   button:active {{ transform:translateY(1px); }}
 </style></head>
@@ -199,36 +205,35 @@ def wrap_html(svg: str, caption: str) -> str:
 # --- PNG export (best-effort) -----------------------------------------------
 
 def render_png(score: dict, top_finding: dict | None, meta: dict | None, out_path: str) -> bool:
-    """Render the card to a 1200×630 PNG. Returns True on success.
-
-    Primary path is Pillow (self-contained wheels, no system libs). Falls back
-    to cairosvg if Pillow is absent. Returns False (caller shows a screenshot
-    hint) if neither is available.
-    """
+    """Render the card to a 1200×630 PNG. Returns True on success. Pillow is the
+    primary path (self-contained wheels, brand fonts); cairosvg is the fallback.
+    Returns False if neither is available (caller shows a screenshot hint)."""
     if _render_png_pillow(score, top_finding, meta, out_path):
         return True
     return _render_png_cairosvg(score, top_finding, meta, out_path)
 
 
-def _load_font(size: int, bold: bool = False):
+_FONT_CACHE: dict = {}
+
+
+def _font(family: str, size: int, weight: int = 600):
+    """Load a bundled brand variable font at a given weight. family: 'display'
+    (Raleway) | 'body' (Open Sans). Falls back to Pillow's default."""
+    key = (family, size, weight)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
     from PIL import ImageFont
-    candidates = (
-        ["/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-         "/System/Library/Fonts/Helvetica.ttc",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]
-        if bold else
-        ["/System/Library/Fonts/Supplemental/Arial.ttf",
-         "/System/Library/Fonts/Helvetica.ttc",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
-    )
-    for path in candidates:
+    fname = "Raleway-Variable.ttf" if family == "display" else "OpenSans-Variable.ttf"
+    try:
+        f = ImageFont.truetype(str(_ASSETS / "fonts" / fname), size)
         try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
+            f.set_variation_by_axes([weight])  # variable fonts default to thin
+        except Exception:
+            pass
+    except OSError:
+        f = ImageFont.load_default()
+    _FONT_CACHE[key] = f
+    return f
 
 
 def _render_png_pillow(score: dict, top_finding, meta, out_path: str) -> bool:
@@ -242,56 +247,73 @@ def _render_png_pillow(score: dict, top_finding, meta, out_path: str) -> bool:
         tier = score.get("tier", "")
         gcolor = grade_color(grade)
 
-        img = Image.new("RGB", (WIDTH, HEIGHT), BG)
+        # Vertical page gradient.
+        img = Image.new("RGB", (WIDTH, HEIGHT), PAGE_TOP)
+        top = tuple(int(PAGE_TOP[i:i+2], 16) for i in (1, 3, 5))
+        bot = tuple(int(PAGE_BOT[i:i+2], 16) for i in (1, 3, 5))
+        px = img.load()
+        for y in range(HEIGHT):
+            t = y / HEIGHT
+            row = tuple(int(top[c] + (bot[c] - top[c]) * t) for c in range(3))
+            for x in range(WIDTH):
+                px[x, y] = row
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle([32, 32, WIDTH - 32, HEIGHT - 32], radius=28, fill=CARD)
+        d.rounded_rectangle([32, 32, WIDTH - 32, HEIGHT - 32], radius=28,
+                            fill=CARD, outline=RULE, width=2)
 
-        def text(xy, s, size, color, bold=False, anchor="la"):
-            d.text(xy, s, font=_load_font(size, bold), fill=color, anchor=anchor)
+        def text(xy, s, fam, size, color, weight=600, anchor="la"):
+            d.text(xy, s, font=_font(fam, size, weight), fill=color, anchor=anchor)
 
-        text((80, 78), "TOKENMIN SCORE", 26, MUTED, bold=True)
+        text((80, 76), "TOKENMIN SCORE", "display", 26, INDIGO, 700)
 
-        # Hero ring.
-        cx, cy, r = 230, 300, 150
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=TRACK, width=20)
+        # Logomark top-right (RGBA paste).
+        try:
+            logo = Image.open(_ASSETS / "rmw_logomark.png").convert("RGBA")
+            logo = logo.resize((88, 88), Image.LANCZOS)
+            img.paste(logo, (1000, 56), logo)
+        except Exception:
+            pass
+
+        # Hero ring + grade.
+        cx, cy, r = 232, 322, 150
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=TRACK, width=22)
         frac = max(0.0, min(1.0, comp / 100.0))
         if frac > 0:
             d.arc([cx - r, cy - r, cx + r, cy + r], start=-90, end=-90 + 360 * frac,
-                  fill=gcolor, width=20)
-        text((cx, cy), grade, 150, gcolor, bold=True, anchor="mm")
-        text((cx, cy + 90), f"{comp}/100", 30, MUTED, bold=True, anchor="mm")
+                  fill=gcolor, width=22)
+        text((cx, cy), grade, "display", 150, gcolor, 800, anchor="mm")
+        text((cx, cy + 92), f"{comp}/100", "body", 30, INK2, 700, anchor="mm")
 
         # Right column.
-        rx = 470
-        text((rx, 140), tier, 58, TEXT, bold=True, anchor="lm")
+        rx = 472
+        text((rx, 150), tier, "display", 58, INDIGO, 800, anchor="lm")
         nxt = _next_line(top_finding)
         if score.get("provisional"):
-            text((rx, 190), "provisional — re-run after a week of use", 23, MUTED)
+            text((rx, 196), "provisional — re-run after a week of use", "body", 23, MUTED)
         elif nxt:
             sub = nxt if len(nxt) <= 52 else nxt[:51] + "…"
-            text((rx, 190), sub, 23, ACCENT, bold=True)
+            text((rx, 196), sub, "body", 23, ACCENT, 600)
 
-        by = 268
-        bar_w, bar_h = 560, 16
+        by, bar_w, bar_h = 282, 556, 16
         for p in ("1", "2", "3", "4"):
             pls = score.get("pillars", {})
             if p not in pls:
                 continue
             label = score.get("pillar_labels", {}).get(p, f"Pillar {p}")
             val = int(pls[p])
-            text((rx, by - 26), label, 22, MUTED, bold=True)
-            text((rx + bar_w, by - 26), str(val), 22, TEXT, bold=True, anchor="ra")
+            text((rx, by - 26), label, "body", 22, INK2, 600)
+            text((rx + bar_w, by - 26), str(val), "body", 22, INK, 700, anchor="ra")
             d.rounded_rectangle([rx, by, rx + bar_w, by + bar_h], radius=8, fill=TRACK)
-            fill_w = max(8, int(bar_w * max(0, min(100, val)) / 100))
-            d.rounded_rectangle([rx, by, rx + fill_w, by + bar_h], radius=8, fill=gcolor)
-            by += 64
+            fw = max(8, int(bar_w * max(0, min(100, val)) / 100))
+            d.rounded_rectangle([rx, by, rx + fw, by + bar_h], radius=8, fill=gcolor)
+            by += 62
 
         fy = HEIGHT - 64
-        d.line([80, fy - 26, WIDTH - 80, fy - 26], fill=TRACK, width=2)
-        text((80, fy), "tokenmin.ai · built by RMW Commerce", 24, MUTED, bold=True)
+        d.line([80, fy - 26, WIDTH - 80, fy - 26], fill=RULE, width=2)
+        text((80, fy), "tokenmin.ai · built by RMW Commerce", "body", 24, INK2, 600)
         pct = score.get("percentile")
         if pct is not None:
-            text((WIDTH - 80, fy), f"Top {100 - int(pct)}% of developers", 24, TEXT, bold=True, anchor="ra")
+            text((WIDTH - 80, fy), f"Top {100 - int(pct)}% of developers", "body", 24, INDIGO, 700, anchor="ra")
 
         img.save(out_path, "PNG")
         return True
