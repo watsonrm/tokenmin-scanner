@@ -739,6 +739,8 @@ def main(argv: list[str] | None = None) -> int:
             print("usage: tokenmin show <finding-id> [--apply]", file=sys.stderr)
             return 2
         return _render_show(rest[0], apply=apply)
+    if argv and argv[0] == "share":
+        return _share_cmd(argv[1:])
     if argv and argv[0] == "watch":
         return _watch(argv[1:])
     if argv and argv[0] == "demo":
@@ -1312,21 +1314,26 @@ def _render_terminal(result: dict) -> None:
             print(ln)
         print()
 
-    # v0.12.11 (P4): lever / pillar scorecard derived from this run's
-    # findings. Directional — flags which pillar has the most headroom.
-    score = _lever_scorecard(findings)
-    if score:
-        ranked = sorted(score.items(), key=lambda kv: kv[1]["score"])
-        chunks = []
-        for pid, b in ranked:
-            label = _PILLAR_LABELS.get(pid, pid)
-            chunks.append(f"{label} {b['score']:.0f}/10")
-        worst = ranked[0]
-        worst_label = _PILLAR_LABELS.get(worst[0], worst[0])
-        print(f"  {c.BOLD}Levers{c.RESET}  {c.DIM}{'  ·  '.join(chunks)}{c.RESET}")
-        if worst[1]["score"] < 9.0:
-            print(f"          {c.DIM}most headroom: {worst_label}{c.RESET}")
-        print()
+    # v0.13: Tokenmin Score hero — composite grade + tier + pillar bars, from
+    # the engine's single-source score (engine/scoring.py). Falls back to the
+    # legacy directional levers line if an older engine returned no score.
+    ts = result.get("tokenmin_score") or {}
+    if ts.get("grade"):
+        _print_score_hero(c, ts)
+    else:
+        score = _lever_scorecard(findings)
+        if score:
+            ranked = sorted(score.items(), key=lambda kv: kv[1]["score"])
+            chunks = []
+            for pid, b in ranked:
+                label = _PILLAR_LABELS.get(pid, pid)
+                chunks.append(f"{label} {b['score']:.0f}/10")
+            worst = ranked[0]
+            worst_label = _PILLAR_LABELS.get(worst[0], worst[0])
+            print(f"  {c.BOLD}Levers{c.RESET}  {c.DIM}{'  ·  '.join(chunks)}{c.RESET}")
+            if worst[1]["score"] < 9.0:
+                print(f"          {c.DIM}most headroom: {worst_label}{c.RESET}")
+            print()
 
     # Headline — plan-aware. Counts include both buckets so the user knows
     # the engine isn't broken when 7 findings collapse to 3 in the display.
@@ -1627,6 +1634,9 @@ def _save_last_run(result: dict) -> None:
         # API). Without this, show always defaults to "unknown" → dollars
         # leak even after the v0.12.3 main-audit fix.
         "billing_plan": result.get("billing_plan", "unknown"),
+        # v0.13: persist the Tokenmin Score so `tokenmin share` can render the
+        # scorecard from the last run without re-analyzing.
+        "tokenmin_score": result.get("tokenmin_score", {}),
         "engine_version": result.get("engine_version", ""),
     }
     data = json.dumps(payload, indent=2, default=str).encode("utf-8")
@@ -1942,6 +1952,85 @@ def _lever_scorecard(findings: list[dict]) -> dict[str, dict]:
         bucket["count"] += 1
         bucket["top_savings"] = max(bucket["top_savings"], save * conf)
     return out
+
+
+# --- Tokenmin Score hero + share (v0.13) -----------------------------------
+
+def _grade_ansi(c: "_C", grade: str) -> str:
+    g = (grade or "F")[0].upper()
+    return {"A": c.GREEN, "B": c.CYAN, "C": c.YELLOW, "D": c.YELLOW, "F": c.RED}.get(g, c.RED)
+
+
+def _print_score_hero(c: "_C", ts: dict) -> None:
+    grade = ts.get("grade", "?")
+    comp = ts.get("composite", 0)
+    tier = ts.get("tier", "")
+    gc = _grade_ansi(c, grade)
+    prov = f"  {c.DIM}(provisional){c.RESET}" if ts.get("provisional") else ""
+    print(f"  {c.BOLD}Tokenmin Score{c.RESET}  {gc}{c.BOLD}{grade}{c.RESET} "
+          f"{c.DIM}{comp}/100{c.RESET}  ·  {c.BOLD}{tier}{c.RESET}{prov}")
+    pls = ts.get("pillars", {})
+    labels = ts.get("pillar_labels", {})
+    chunks = [f"{labels.get(p, p)} {pls[p]}" for p in ("1", "2", "3", "4") if p in pls]
+    if chunks:
+        print(f"  {c.DIM}{'  ·  '.join(chunks)}{c.RESET}")
+    print(f"  {c.DIM}share it:{c.RESET} {c.CYAN}tokenmin share{c.RESET}")
+    print()
+
+
+def _share_cmd(argv: list[str]) -> int:
+    """Render the last run's Tokenmin Score as a shareable scorecard
+    (SVG + HTML + PNG) under ~/.tokenmin/exports/."""
+    c = _C(_ansi_supported())
+    last = _load_last_run()
+    ts = (last or {}).get("tokenmin_score") or {}
+    if not ts.get("grade"):
+        print("tokenmin: no score to share yet. Run `tokenmin` first, then "
+              "`tokenmin share`.", file=sys.stderr)
+        return 2
+    try:
+        import scorecard  # ships in engine/ — added to sys.path at module load
+    except ImportError:
+        print("tokenmin: scorecard renderer unavailable (engine/ not found).",
+              file=sys.stderr)
+        return 1
+
+    findings = (last or {}).get("findings") or []
+    primary = [f for f in findings if not f.get("low_impact", False)] or findings
+    top = primary[0] if primary else None
+    meta = {
+        "window_days": ((last or {}).get("snapshot") or {}).get("window_days"),
+        "generated": (last or {}).get("saved_at"),
+    }
+
+    out_dir = Path.home() / ".tokenmin" / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    svg_path = out_dir / f"scorecard-{stamp}.svg"
+    html_path = out_dir / f"scorecard-{stamp}.html"
+    png_path = out_dir / f"scorecard-{stamp}.png"
+
+    svg = scorecard.render_svg(ts, top, meta)
+    svg_path.write_text(svg, encoding="utf-8")
+    caption = scorecard.caption_for(ts)
+    html_path.write_text(scorecard.wrap_html(svg, caption), encoding="utf-8")
+    png_ok = scorecard.render_png(ts, top, meta, str(png_path))
+
+    grade = ts.get("grade", "?")
+    print()
+    _print_score_hero(c, ts)
+    print(f"  {c.BOLD}Scorecard{c.RESET}  {c.DIM}saved to {out_dir}{c.RESET}")
+    print(f"    {c.GREEN}✓{c.RESET} {svg_path.name}   {c.DIM}(vector / web){c.RESET}")
+    print(f"    {c.GREEN}✓{c.RESET} {html_path.name}  {c.DIM}(open in a browser; copy-caption button){c.RESET}")
+    if png_ok:
+        print(f"    {c.GREEN}✓{c.RESET} {png_path.name}   {c.DIM}(1200×630 — post this){c.RESET}")
+    else:
+        print(f"    {c.YELLOW}–{c.RESET} PNG: open the .html and screenshot, or "
+              f"{c.CYAN}pip install pillow{c.RESET} for auto-PNG")
+    print()
+    print(f"  {c.BOLD}Caption{c.RESET}  {c.DIM}{caption}{c.RESET}")
+    print()
+    return 0
 
 
 # --- progress indicator ----------------------------------------------------

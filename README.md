@@ -48,6 +48,27 @@ severity pills, per-finding next-action. Then `tokenmin show <id>` drills
 into one finding's evidence + fix. Then `tokenmin watch` runs a live
 dashboard while you work.
 
+## Your Tokenmin Score
+
+Every run grades your setup with a single **Tokenmin Score** — a letter grade
+(A+ … F), a 0–100 number, four pillar sub-scores, and a named tier:
+
+```
+  Tokenmin Score  C- 71/100  ·  Solid Operator
+  Context & config 92  ·  Model routing 77  ·  Parallelism & MCP 58  ·  Density 50
+```
+
+The rubric is deterministic and public — see [`SCORING.md`](SCORING.md). A grade
+is only worth sharing if you can see how it was computed.
+
+```bash
+tokenmin share            # render a shareable scorecard (SVG + HTML + PNG)
+```
+
+`tokenmin share` writes a 1200×630 social card to `~/.tokenmin/exports/`
+(plus a browser HTML view with a copy-caption button). Like every Tokenmin
+output it contains only aggregate numbers — no paths, names, or content.
+
 ## What's in here
 
 | Concern | Where |
@@ -57,6 +78,8 @@ dashboard while you work.
 | Anonymization (paths, secrets, labels, identifiers) | [`skills/tokenmin/anonymize.py`](skills/tokenmin/anonymize.py) |
 | Orchestrator CLI: collect → anonymize → analyze → render | [`skills/tokenmin/tokenmin.py`](skills/tokenmin/tokenmin.py) |
 | Detection rule base | [`engine/patterns.py`](engine/patterns.py) |
+| Tokenmin Score (composite grade rubric) | [`engine/scoring.py`](engine/scoring.py) · [`SCORING.md`](SCORING.md) |
+| Shareable scorecard (SVG / HTML / PNG) | [`engine/scorecard.py`](engine/scorecard.py) |
 | Report rendering | [`engine/report.py`](engine/report.py) |
 | Pricing lookup | [`engine/pricing.py`](engine/pricing.py) + [`engine/pricing.json`](engine/pricing.json) |
 | Local HTTP server skeleton (for `--submit-url` testing) | [`server/tokenmin_server.py`](server/tokenmin_server.py) |
@@ -94,6 +117,7 @@ After install:
 ```bash
 tokenmin --selfcheck      # see the anonymizer rules without reading Python
 tokenmin                  # scan + render inline (the magic moment)
+tokenmin share            # render a shareable scorecard (SVG + HTML + PNG)
 tokenmin watch            # live dashboard
 tokenmin show <id>        # drill into one finding
 tokenmin help             # 30-second walkthrough

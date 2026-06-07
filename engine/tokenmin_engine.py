@@ -22,6 +22,14 @@ from collections import Counter
 from analyzer import Snapshot, SessionStats, ConfigSnapshot
 from patterns import run_all
 from report import render
+from scoring import compute_score
+
+
+def _monthly_api(snap: Snapshot) -> float:
+    """Scale the window's API-equivalent cost up to a 30-day rate."""
+    if snap.window_days > 0:
+        return snap.total_cost * 30.0 / snap.window_days
+    return 0.0
 
 
 def _session_from_dict(d: dict) -> SessionStats:
@@ -109,7 +117,8 @@ def analyze(snapshot: dict) -> str:
     """Engine entry point. Anonymized snapshot dict -> Markdown report."""
     snap = _snapshot_from_dict(snapshot)
     findings = run_all(snap)
-    return render(snap, findings)
+    score = compute_score(snap, findings, _monthly_api(snap))
+    return render(snap, findings, score=score)
 
 
 def analyze_structured(snapshot: dict, billing_plan: str = "unknown") -> dict:
@@ -242,6 +251,11 @@ def analyze_structured(snapshot: dict, billing_plan: str = "unknown") -> dict:
         else:
             f["low_impact"] = sv < LOW_IMPACT_USD
 
+    # Tokenmin Score — composite grade computed from the same findings. Single
+    # source of truth (scoring.py) so the terminal card, markdown report, and
+    # shareable scorecard never disagree.
+    score = compute_score(snap, findings, monthly_api_cost)
+
     return {
         "snapshot": {
             "sessions": len(snap.sessions),
@@ -278,6 +292,7 @@ def analyze_structured(snapshot: dict, billing_plan: str = "unknown") -> dict:
         "total_savings_usd_per_month": sum(f.savings_usd_per_month for f in findings),
         "total_hours_to_implement": sum(f.hours_to_implement for f in findings),
         "billing_plan": plan,
-        "report_md": render(snap, findings, billing_plan=plan),
-        "engine_version": "0.5",
+        "tokenmin_score": score,
+        "report_md": render(snap, findings, billing_plan=plan, score=score),
+        "engine_version": "0.6",
     }

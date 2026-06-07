@@ -9,7 +9,7 @@
 			"name": "tokenmin",
 			"source": "./",
 			"description": "Tokenmin — Apache-2.0 scanner + engine that audits how you use Claude and recommends concrete improvements. Reads ~/.claude, anonymizes locally, never sends anything off-machine by default.",
-			"version": "0.3.0",
+			"version": "0.4.0",
 			"author": {
 				"name": "Rick Watson",
 				"email": "rick@rmwcommerce.com"

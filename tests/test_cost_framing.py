@@ -249,8 +249,8 @@ class EngineSchemaSurface(unittest.TestCase):
 
     def test_engine_version_advanced(self):
         r = analyze_structured(_opus_heavy_snapshot())
-        # Bumped from 0.4 -> 0.5 with the cost-framing redesign.
-        self.assertEqual(r["engine_version"], "0.5")
+        # 0.4 -> 0.5 (cost-framing redesign) -> 0.6 (Tokenmin Score block).
+        self.assertEqual(r["engine_version"], "0.6")
 
     def test_invalid_plan_normalizes_to_unknown(self):
         r = analyze_structured(_opus_heavy_snapshot(), billing_plan="bogus")

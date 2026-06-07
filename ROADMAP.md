@@ -6,6 +6,18 @@ Items in priority order. PRs and issues welcome.
 
 (nothing in flight — preview phase, gathering F&F feedback)
 
+## Shipped
+
+### Tokenmin Score + shareable scorecard (v0.13)
+
+A single composite grade (A+ … F · 0–100 · four pillar sub-scores · named
+tier) over the optimizer pillars, with a published rubric ([`SCORING.md`](SCORING.md))
+so the methodology is legible. `tokenmin share` renders a 1200×630 social
+scorecard (SVG + browser HTML + PNG) to `~/.tokenmin/exports/`; aggregate
+numbers only, safe to share by construction. Rubric lives in
+[`engine/scoring.py`](engine/scoring.py); rendering in
+[`engine/scorecard.py`](engine/scorecard.py).
+
 ## Next
 
 ### Hosted analyze endpoint (Vercel)
@@ -47,6 +59,9 @@ analytics dashboard.
   `--source export`)
 - Rule-base community contribution flow once enough usage data validates
   which rules carry their weight
+- **Tokenmin Score percentile** — the scorecard reserves a "top N% of
+  developers" line; it fills in once the anonymized corpus is large enough to
+  compute honestly (gated on the hosted endpoint above). Never faked.
 
 ## Hosting decision log
 

@@ -33,4 +33,6 @@ python3 "${here}/test_v0_12_6.py"
 echo
 python3 "${here}/test_v0_12_9.py"
 echo
+python3 "${here}/test_scoring.py"
+echo
 echo "tokenmin tests: ok"

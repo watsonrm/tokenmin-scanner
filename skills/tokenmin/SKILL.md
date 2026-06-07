@@ -33,10 +33,11 @@ both ship Apache-2.0 in this repo. See LICENSING.md.
 3. **Summarize the output** in 4 short sections (the inline CLI output is already
    formatted; just relay it. If you ran `tokenmin.py` and got a report file, format
    it the same way):
+   - **Tokenmin Score** (lead with it: the letter grade, 0–100, and tier)
    - Usage snapshot (one line: sessions, tokens, est. cost)
-   - Top 3 friction patterns (one line each, with evidence count)
-   - Top 3 recommendations (ranked)
-   - Offer to implement the #1 recommendation right now
+   - Top 3 recommendations (ranked, with evidence count)
+   - Offer to implement the #1 recommendation now, and mention `tokenmin share`
+     to render a shareable scorecard (SVG + HTML + PNG → `~/.tokenmin/exports/`)
 
 4. **If the user says yes to implementing**, open the relevant config file
    (`~/.claude/settings.json`, `~/.claude/CLAUDE.md`, etc.), make the change,

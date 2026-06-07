@@ -20,6 +20,12 @@ def _fmt_money(x: float) -> str:
     return f"${x:.2f}"
 
 
+def _score_bar(v: int, width: int = 10) -> str:
+    """ASCII bar for a 0–100 pillar score."""
+    filled = round(max(0, min(100, v)) / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000_000:
         return f"{n/1_000_000:.1f}M"
@@ -97,7 +103,8 @@ def _fmt_savings(savings_usd_per_month: float, plan: str, monthly_api: float) ->
     return f"~{pct:.0f}% quota"
 
 
-def render(snap: Snapshot, findings: list[Finding], billing_plan: str = "unknown") -> str:
+def render(snap: Snapshot, findings: list[Finding], billing_plan: str = "unknown",
+           score: dict | None = None) -> str:
     cfg = snap.config
     n_sessions = len(snap.sessions)
     avg_tools = 0.0
@@ -134,6 +141,30 @@ def render(snap: Snapshot, findings: list[Finding], billing_plan: str = "unknown
         "Pillar 1 (context + config discipline) is where ~80% of the gains live."
     )
     out.append("")
+
+    if score and score.get("grade"):
+        out.append("---")
+        out.append("")
+        prov = " _(provisional — re-run after a week of use)_" if score.get("provisional") else ""
+        out.append(f"## Your Tokenmin Score: {score['grade']} · {score.get('composite', 0)}/100")
+        out.append("")
+        out.append(f"**{score.get('tier', '')}**{prov}")
+        out.append("")
+        pls = score.get("pillars", {})
+        labels = score.get("pillar_labels", {})
+        if pls:
+            out.append("| Pillar | Score |")
+            out.append("|---|---|")
+            for p in ("1", "2", "3", "4"):
+                if p in pls:
+                    out.append(f"| {labels.get(p, p)} | `{_score_bar(pls[p])}` {pls[p]}/100 |")
+            out.append("")
+        if score.get("percentile") is not None:
+            out.append(f"_Better than {int(score['percentile'])}% of developers who ran Tokenmin._")
+            out.append("")
+        out.append("_Share your score: `tokenmin share`._")
+        out.append("")
+
     out.append("---")
     out.append("")
     out.append("## TL;DR")
